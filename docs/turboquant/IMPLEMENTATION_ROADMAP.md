@@ -4,6 +4,31 @@ This document outlines the phased implementation plan for integrating TurboQuant
 
 ---
 
+## Current Status (2026-03-25)
+
+| Phase | Status | Notes |
+|---|---|---|
+| Phase 1: Core Library | DONE | codebook, rotation, quant_ops, packing all working |
+| Phase 2: SGLang Integration | DONE | Config, KVCacheMethod, TurboQuantTokenToKVPool, CLI args, Qwen3.5 model fix, HybridLinearKVPool integration |
+| Phase 3: Triton Kernels | NOT STARTED | |
+| Phase 4: CUDA Kernels | NOT STARTED | |
+| Phase 5: Validation | IN PROGRESS | Server starts, TurboQuant pool initializes (3.1x savings), but garbled output due to dequant buffer invalidation bug |
+
+### Known Bug: Shared Dequant Buffer
+
+The `TurboQuantTokenToKVPool` uses a single shared dequant buffer pair for all layers. The `_ensure_dequant()` method skips re-dequantization when `_dequant_layer_id == layer_id`, but `set_kv_buffer()` only writes dequantized data for the newly stored `loc` positions. When a different code path calls `get_kv_buffer()` for the same layer, the buffer contains stale/zero data at positions not recently written. This causes garbled attention output.
+
+**Fix options:**
+1. Always dequant the full buffer on `get_kv_buffer` (simple but slow — O(pool_size * head_dim) per layer per forward)
+2. Track dirty positions per layer and selectively dequant (complex bookkeeping)
+3. Remove the shared buffer optimization and use per-layer dequant buffers (uses more memory but simpler)
+
+### Hybrid Architecture Integration
+
+`HybridLinearKVPool` (for Qwen3.5's DeltaNet + full attention hybrid) now accepts `kv_cache_quantization` parameter and creates `TurboQuantTokenToKVPool` as its inner `full_kv_pool` when `kv_cache_quantization == "turboquant"`. Modified in both `memory_pool.py` and `model_runner_kv_cache_mixin.py`.
+
+---
+
 ## Key Design Decisions
 
 | Decision | Choice | Rationale |

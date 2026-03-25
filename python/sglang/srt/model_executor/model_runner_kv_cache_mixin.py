@@ -610,6 +610,9 @@ class ModelRunnerKVCacheMixin:
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
+                    kv_cache_quantization=getattr(self.server_args, "kv_cache_quantization", None),
+                    turboquant_bits=getattr(self.server_args, "turboquant_bits", 3),
+                    turboquant_seed=getattr(self.server_args, "turboquant_seed", 42),
                     **extra_args,
                 )
             elif getattr(self.server_args, "kv_cache_quantization", None) == "turboquant":

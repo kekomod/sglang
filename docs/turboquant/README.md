@@ -37,6 +37,32 @@ Needle-in-a-haystack: 0.997 (identical to full precision) at 4x compression.
 - **PolarQuant repo:** [github.com/ericshwu/PolarQuant](https://github.com/ericshwu/PolarQuant) — Triton kernels for polar coordinate quantization
 - **MLX-VLM PR:** [Blaizzy/mlx-vlm#858](https://github.com/Blaizzy/mlx-vlm/pull/858) — Reference implementation for Apple MLX (confirmed faithful to paper)
 
+## Quick Start
+
+```bash
+# Setup
+conda activate turboquant
+cd /home/keko/AI/turboquant/sglang
+pip install -e "python[all]"
+
+# Run with TurboQuant
+python -m sglang.launch_server \
+    --model /home/keko/AI/image-prep/models/uncensored-9b-bf16-hf \
+    --kv-cache-quantization turboquant \
+    --turboquant-bits 3 \
+    --port 30000 \
+    --disable-cuda-graph \
+    --context-length 4096
+```
+
+## Current Status
+
+- Phase 1 core library: complete (codebook, rotation, quant/dequant ops, bit-packing)
+- SGLang integration: complete (config, kv_cache_method, pool, CLI args, model fix)
+- Hybrid architecture support: complete (`HybridLinearKVPool` passes through to `TurboQuantTokenToKVPool`)
+- Known issue: shared dequant buffer invalidation bug (garbled output, under investigation)
+- Custom CUDA/Triton kernels: not yet (Phase 1 uses dequant-then-FlashAttention)
+
 ## Documentation
 
 - [Paper Summary](PAPER_SUMMARY.md) — Complete mathematical specification from the paper

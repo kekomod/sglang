@@ -240,3 +240,36 @@ class TurboQuantTokenToKVPool(KVCache):
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def get_kv_size_bytes(self):
+        """Return (k_size_bytes, v_size_bytes) for memory accounting."""
+        k_bytes = sum(
+            b.nelement() * b.element_size()
+            for bufs in [self.k_mse_buffer, self.k_qjl_buffer,
+                         self.k_norm_buffer, self.k_residual_norm_buffer]
+            for b in bufs
+        )
+        # Include shared dequant buffer for keys
+        k_bytes += self.k_dequant.nelement() * self.k_dequant.element_size()
+
+        v_bytes = sum(
+            b.nelement() * b.element_size()
+            for bufs in [self.v_packed_buffer, self.v_norm_buffer]
+            for b in bufs
+        )
+        v_bytes += self.v_dequant.nelement() * self.v_dequant.element_size()
+
+        return k_bytes, v_bytes
+
+    def get_contiguous_buf_infos(self):
+        """Return buffer info for disaggregated serving (uses dequant buffers)."""
+        kv_data_ptrs = [self.k_dequant.data_ptr(), self.v_dequant.data_ptr()]
+        kv_data_lens = [
+            self.k_dequant.nelement() * self.k_dequant.element_size(),
+            self.v_dequant.nelement() * self.v_dequant.element_size(),
+        ]
+        kv_item_lens = [
+            self.head_num * self.head_dim * self.k_dequant.element_size(),
+            self.head_num * self.head_dim * self.v_dequant.element_size(),
+        ]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens

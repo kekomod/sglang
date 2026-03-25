@@ -152,7 +152,7 @@ class MHATokenToKVPool(KVCache):
 ### Hybrid Pool (for Qwen3.5)
 `HybridLinearKVPool` wraps separate pools for full-attention and linear-attention layers, handling the layer ID mapping between global layer IDs and per-type indices.
 
-**For TurboQuant:** Need a new `TurboQuantTokenToKVPool(KVCache)` that stores packed indices, norms, and QJL signs instead of dense FP16 tensors.
+**TurboQuant integration (DONE):** `HybridLinearKVPool` now accepts `kv_cache_quantization` parameter. When set to `"turboquant"`, it creates `TurboQuantTokenToKVPool` as its inner `full_kv_pool` instead of `MHATokenToKVPool`. Modified in `memory_pool.py` line ~1254 and `model_runner_kv_cache_mixin.py` line ~590.
 
 ---
 

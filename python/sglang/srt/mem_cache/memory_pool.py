@@ -1235,6 +1235,9 @@ class HybridLinearKVPool(KVCache):
         use_mla: bool = False,
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
+        kv_cache_quantization: str = None,
+        turboquant_bits: int = 3,
+        turboquant_seed: int = 42,
     ):
         self.size = size
         self.dtype = dtype
@@ -1251,25 +1254,43 @@ class HybridLinearKVPool(KVCache):
         self.use_mla = use_mla
         if not use_mla:
 
-            TokenToKVPoolClass = MHATokenToKVPool
-
-            if _is_npu:
-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                    NPUMHATokenToKVPool,
+            if kv_cache_quantization == "turboquant":
+                from sglang.srt.mem_cache.turboquant_pool import (
+                    TurboQuantTokenToKVPool,
                 )
 
-                TokenToKVPoolClass = NPUMHATokenToKVPool
+                self.full_kv_pool = TurboQuantTokenToKVPool(
+                    size=size,
+                    page_size=self.page_size,
+                    dtype=dtype,
+                    head_num=head_num,
+                    head_dim=head_dim,
+                    layer_num=self.full_layer_nums,
+                    device=device,
+                    enable_memory_saver=enable_memory_saver,
+                    turboquant_bits=turboquant_bits,
+                    turboquant_seed=turboquant_seed,
+                )
+            else:
+                TokenToKVPoolClass = MHATokenToKVPool
 
-            self.full_kv_pool = TokenToKVPoolClass(
-                size=size,
-                page_size=self.page_size,
-                dtype=dtype,
-                head_num=head_num,
-                head_dim=head_dim,
-                layer_num=self.full_layer_nums,
-                device=device,
-                enable_memory_saver=enable_memory_saver,
-            )
+                if _is_npu:
+                    from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                        NPUMHATokenToKVPool,
+                    )
+
+                    TokenToKVPoolClass = NPUMHATokenToKVPool
+
+                self.full_kv_pool = TokenToKVPoolClass(
+                    size=size,
+                    page_size=self.page_size,
+                    dtype=dtype,
+                    head_num=head_num,
+                    head_dim=head_dim,
+                    layer_num=self.full_layer_nums,
+                    device=device,
+                    enable_memory_saver=enable_memory_saver,
+                )
         else:
 
             TokenToKVPoolClass = MLATokenToKVPool
