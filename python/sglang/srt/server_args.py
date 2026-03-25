@@ -144,6 +144,8 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    # TurboQuant fused kernels (opt-in, requires --kv-cache-quantization turboquant)
+    "turboquant",
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
@@ -2240,13 +2242,14 @@ class ServerArgs:
         ):  # override the default attention backend
             self.attention_backend = self.prefill_attention_backend
 
-        # Auto-select turboquant backend for turboquant KV cache quantization
+        # TurboQuant KV cache quantization: works with any attention backend
+        # via dequant-on-read. For fused kernels, user can opt-in with
+        # --attention-backend turboquant
         if getattr(self, "kv_cache_quantization", None) == "turboquant":
-            if self.attention_backend is None:
-                self.attention_backend = "turboquant"
-                logger.info(
-                    "TurboQuant KV cache quantization enabled — using turboquant attention backend"
-                )
+            backend_name = self.attention_backend or "default"
+            logger.info(
+                f"TurboQuant KV cache quantization enabled (attention backend: {backend_name})"
+            )
 
         # Pick the default attention backend if not specified
         if self.attention_backend is None:

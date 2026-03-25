@@ -32,8 +32,8 @@ from sglang.srt.layers.quantization.turboquant.quant_ops import (
     split_channel_prod_quantize,
 )
 from sglang.srt.layers.quantization.turboquant.rotation import (
+    HadamardTransform,
     projection_matrix,
-    rotation_matrix,
 )
 from sglang.srt.mem_cache.memory_pool import KVCache
 
@@ -137,32 +137,30 @@ class TurboQuantTokenToKVPool(KVCache):
         self.v_cb_lo = compute_codebook(d_lo, self.v_lo_bits).to(self.device)
         self.v_cb_hi = compute_codebook(d_hi, self.v_hi_bits).to(self.device)
 
-        # Per-layer rotation/projection matrices (separate per group)
-        self.pi_lo = []
-        self.pi_t_lo = []
-        self.pi_hi = []
-        self.pi_t_hi = []
+        # Per-layer Hadamard transforms and QJL projection matrices (separate per group)
+        self.hadamard_lo = []
+        self.hadamard_hi = []
         self.s_lo = []
         self.s_hi = []
         for i in range(self.layer_num):
             seed_base = self.tq_seed + i * 1000
-            pi_l = rotation_matrix(d_lo, seed_base).to(self.device)
-            pi_h = rotation_matrix(d_hi, seed_base + 97).to(self.device)
-            self.pi_lo.append(pi_l)
-            self.pi_t_lo.append(pi_l.T.contiguous())
-            self.pi_hi.append(pi_h)
-            self.pi_t_hi.append(pi_h.T.contiguous())
+            self.hadamard_lo.append(HadamardTransform(d_lo, seed_base, torch.device(self.device)))
+            self.hadamard_hi.append(HadamardTransform(d_hi, seed_base + 97, torch.device(self.device)))
             self.s_lo.append(projection_matrix(d_lo, seed_base).to(self.device))
             self.s_hi.append(projection_matrix(d_hi, seed_base + 97).to(self.device))
 
-        # Allocate packed buffers — lists indexed by layer
+        # Allocate packed buffers — use padded_dim from Hadamard
         H = self.head_num
-        k_lo_mse_pw = packed_width(d_lo, self.k_lo_mse_bits)
-        k_lo_qjl_pw = packed_width(d_lo, 1)
-        k_hi_mse_pw = packed_width(d_hi, self.k_hi_mse_bits)
-        k_hi_qjl_pw = packed_width(d_hi, 1)
-        v_lo_pw = packed_width(d_lo, self.v_lo_bits)
-        v_hi_pw = packed_width(d_hi, self.v_hi_bits)
+        padded_d_lo = self.hadamard_lo[0].padded_dim
+        padded_d_hi = self.hadamard_hi[0].padded_dim
+        self.padded_d_lo = padded_d_lo
+        self.padded_d_hi = padded_d_hi
+        k_lo_mse_pw = packed_width(padded_d_lo, self.k_lo_mse_bits)
+        k_lo_qjl_pw = packed_width(d_lo, 1)  # QJL on original dim
+        k_hi_mse_pw = packed_width(padded_d_hi, self.k_hi_mse_bits)
+        k_hi_qjl_pw = packed_width(d_hi, 1)  # QJL on original dim
+        v_lo_pw = packed_width(padded_d_lo, self.v_lo_bits)
+        v_hi_pw = packed_width(padded_d_hi, self.v_hi_bits)
 
         def _alloc_uint8(last_dim):
             return [
@@ -214,22 +212,21 @@ class TurboQuantTokenToKVPool(KVCache):
         self.k_codebook = compute_codebook(D, mse_bits).to(self.device)
         self.v_codebook = compute_codebook(D, bits).to(self.device)
 
-        # Per-layer rotation/projection matrices
-        self.pi_matrices = []
-        self.pi_t_matrices = []
+        # Per-layer Hadamard transforms and QJL projection matrices
+        self.k_hadamard = []
         self.s_matrices = []
         for i in range(self.layer_num):
             seed = self.tq_seed + i * 1000
-            pi = rotation_matrix(D, seed).to(self.device)
-            self.pi_matrices.append(pi)
-            self.pi_t_matrices.append(pi.T.contiguous())
+            self.k_hadamard.append(HadamardTransform(D, seed, torch.device(self.device)))
             self.s_matrices.append(projection_matrix(D, seed).to(self.device))
 
-        # Allocate packed buffers
+        # Allocate packed buffers — use padded_dim from Hadamard
         H = self.head_num
-        k_mse_pw = packed_width(D, mse_bits)
-        k_qjl_pw = packed_width(D, 1)
-        v_pw = packed_width(D, bits)
+        padded_D = self.k_hadamard[0].padded_dim
+        self.padded_dim = padded_D
+        k_mse_pw = packed_width(padded_D, mse_bits)
+        k_qjl_pw = packed_width(D, 1)  # QJL is on original dim (residual in original space)
+        v_pw = packed_width(padded_D, bits)
 
         def _alloc_uint8(last_dim):
             return [
@@ -280,7 +277,7 @@ class TurboQuantTokenToKVPool(KVCache):
         (lo_mse_p, lo_qjl_p, lo_n, lo_rn,
          hi_mse_p, hi_qjl_p, hi_n, hi_rn) = split_channel_prod_quantize(
             k, self.lo_indices, self.hi_indices,
-            self.pi_lo[li], self.pi_hi[li],
+            self.hadamard_lo[li], self.hadamard_hi[li],
             self.s_lo[li], self.s_hi[li],
             self.k_cb_lo, self.k_cb_hi,
             self.lo_bits, self.hi_bits,
@@ -297,7 +294,7 @@ class TurboQuantTokenToKVPool(KVCache):
         # Values (mse quantize per group)
         lo_vp, lo_vn, hi_vp, hi_vn = split_channel_mse_quantize(
             v, self.lo_indices, self.hi_indices,
-            self.pi_lo[li], self.pi_hi[li],
+            self.hadamard_lo[li], self.hadamard_hi[li],
             self.v_cb_lo, self.v_cb_hi,
             self.v_lo_bits, self.v_hi_bits,
         )
@@ -311,7 +308,7 @@ class TurboQuantTokenToKVPool(KVCache):
 
         # Keys (prod quantize)
         mse_p, qjl_p, k_n, k_rn = prod_quantize(
-            k, self.pi_matrices[li], self.s_matrices[li],
+            k, self.k_hadamard[li], self.s_matrices[li],
             self.k_codebook, bits,
         )
         self.k_mse_packed[li][loc] = mse_p
@@ -321,7 +318,7 @@ class TurboQuantTokenToKVPool(KVCache):
 
         # Values (mse quantize)
         v_p, v_n = mse_quantize(
-            v, self.pi_matrices[li], self.v_codebook, bits,
+            v, self.k_hadamard[li], self.v_codebook, bits,
         )
         self.v_packed[li][loc] = v_p
         self.v_norms[li][loc] = v_n
@@ -385,7 +382,7 @@ class TurboQuantTokenToKVPool(KVCache):
                 self.k_hi_mse_packed[li], self.k_hi_qjl_packed[li],
                 self.k_hi_norms[li], self.k_hi_res_norms[li],
                 self.lo_indices, self.hi_indices, self.restore_order,
-                self.pi_t_lo[li], self.pi_t_hi[li],
+                self.hadamard_lo[li], self.hadamard_hi[li],
                 self.s_lo[li], self.s_hi[li],
                 self.k_cb_lo, self.k_cb_hi,
                 self.lo_bits, self.hi_bits, self.head_dim,
@@ -394,7 +391,7 @@ class TurboQuantTokenToKVPool(KVCache):
             return prod_dequantize(
                 self.k_mse_packed[li], self.k_qjl_packed[li],
                 self.k_norms[li], self.k_res_norms[li],
-                self.pi_t_matrices[li], self.s_matrices[li],
+                self.k_hadamard[li], self.s_matrices[li],
                 self.k_codebook, self.int_bits, self.head_dim,
             ).to(self.dtype)
 
@@ -409,14 +406,14 @@ class TurboQuantTokenToKVPool(KVCache):
                 self.v_lo_packed[li], self.v_lo_norms[li],
                 self.v_hi_packed[li], self.v_hi_norms[li],
                 self.lo_indices, self.hi_indices, self.restore_order,
-                self.pi_t_lo[li], self.pi_t_hi[li],
+                self.hadamard_lo[li], self.hadamard_hi[li],
                 self.v_cb_lo, self.v_cb_hi,
                 self.v_lo_bits, self.v_hi_bits, self.head_dim,
             ).to(self.dtype)
         else:
             return mse_dequantize(
                 self.v_packed[li], self.v_norms[li],
-                self.pi_t_matrices[li], self.v_codebook,
+                self.k_hadamard[li], self.v_codebook,
                 self.int_bits, self.head_dim,
             ).to(self.dtype)
 

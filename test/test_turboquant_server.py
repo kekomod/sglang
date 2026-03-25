@@ -9,7 +9,7 @@ import sys
 import requests
 
 BASE_URL = "http://localhost:30000"
-TIMEOUT = 120
+TIMEOUT = 300  # 5 min — dequant-on-read path is slower than fused kernels
 
 
 def generate(prompt, max_new_tokens=20, temperature=0.1):

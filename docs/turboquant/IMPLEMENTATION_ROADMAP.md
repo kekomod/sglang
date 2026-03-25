@@ -10,15 +10,48 @@ This document outlines the phased implementation plan for integrating TurboQuant
 |---|---|---|
 | Phase 1: Core Library | DONE | codebook, rotation, quant_ops, packing all working |
 | Phase 2: SGLang Integration | DONE | Config, KVCacheMethod, TurboQuantTokenToKVPool, CLI args, Qwen3.5 model fix, HybridLinearKVPool integration |
-| Phase 3: Triton Kernels | DONE (Phase A) | Triton decode kernel reads packed uint8 KV directly, split-channel codec, compact pool storage, turboquant attention backend |
-| Phase 4: CUDA Kernels | NOT STARTED | |
-| Phase 5: Validation | IN PROGRESS | 3-bit integer path generates coherent output. KV cache: 0.04 GB vs ~3.9 GB BF16. Split-channel decode (3.5-bit) not yet wired. |
+| Phase 3A: Triton Decode Kernel | DONE | Triton decode kernel reads packed uint8 KV directly, split-channel codec, compact pool storage |
+| Phase 3B: Triton Extend Kernel | DONE | Fused extend/prefill kernel reads ALL KV from quantized buffers (quantize-first approach). Both integer and split-channel paths. |
+| Phase 4: Hadamard + Kernel-Agnostic | DONE | Replaced QR rotation with Fast Walsh-Hadamard Transform (O(d log d), O(d) storage). Removed forced backend — TurboQuant now works with any attention backend via dequant-on-read. Fused kernels opt-in via `--attention-backend turboquant`. |
+| Phase 5: Validation | PARTIAL | 11/11 kernel tests pass. 6/6 server tests pass (fused). Needle-in-haystack: 19/20 = 95% at 3.5-bit (meets target). GSM8K and perplexity benchmarks written but not yet run. |
+
+### Step 3 Completion Summary (Phase 3B)
+
+**New files:**
+- `layers/attention/triton_ops/turboquant_extend_attention.py` — Fused Triton extend kernel for prefill/extend. Unified single-loop design: reads ALL KV from quantized buffers via kv_indices page table. Both integer-bit (`_turboquant_extend_kernel` + `turboquant_extend_attention_fwd`) and split-channel (`_turboquant_extend_kernel_split` + `turboquant_extend_attention_fwd_split`) variants. No Stage 2 reduction (single-stage online softmax). Causal masking: prefix tokens always visible, extend tokens masked causally.
+- `benchmark/turboquant/common.py` — Shared benchmark infrastructure (server lifecycle, HTTP helpers, result I/O)
+- `benchmark/turboquant/eval_perplexity.py` — Wikitext-2 perplexity benchmark
+- `benchmark/turboquant/eval_needle.py` — Needle-in-haystack retrieval benchmark
+- `benchmark/turboquant/eval_gsm8k.py` — GSM8K arithmetic reasoning benchmark
+- `benchmark/turboquant/run_all.py` — Master benchmark runner
+
+**Modified:**
+- `layers/attention/turboquant_backend.py` — Now overrides BOTH `forward_decode` AND `forward_extend`. The extend path uses quantize-first flow: quantize fresh K/V into pool first, build unified kv_indices, pre-rotate/project queries, call fused extend kernel, inverse-rotate output. No BF16 dequant buffers materialized.
+- `test/test_turboquant_kernel.py` — Added 4 extend kernel tests (integer + split + causal mask + variable batch). All 11 tests pass with cosine_sim=1.0000.
+
+**Key design decision: Quantize-first approach (matching MLX):**
+The backend quantizes fresh K/V into the pool BEFORE calling the extend kernel. Then ALL KV (prefix + extend) is in quantized form, and the kernel reads from a single unified path. This eliminates the need for a mixed BF16+quantized kernel.
+
+### Step 4 Completion Summary (Phase 4: Hadamard + Kernel-Agnostic)
+
+**Rotation: QR → Hadamard (FWHT)**
+- Replaced QR decomposition (O(d^2) matmul, D x D matrix per layer) with randomized Hadamard transform (O(d log d) FWHT, just a sign vector per layer)
+- `rotation.py` — Added `HadamardTransform` class with forward/inverse/FWHT. Removed `rotation_matrix()`. Kept `projection_matrix()` for QJL.
+- `quant_ops.py` — All quantize/dequantize functions now accept `hadamard` instead of `pi`/`pi_t` matrix parameters
+- `turboquant_pool.py` — Stores `k_hadamard` / `hadamard_lo` / `hadamard_hi` per layer instead of D x D matrices. Buffer allocation uses Hadamard `padded_dim` (next power-of-2).
+- `turboquant_backend.py` — Uses `hadamard.forward()` / `hadamard.inverse()` for query pre-rotation and output inverse-rotation
+- Memory savings: ~4.7 MB of rotation matrices → ~18 KB of sign vectors (for D=128, L=36)
+
+**Kernel-Agnostic Backend**
+- Removed forced `attention_backend = "turboquant"` from `server_args.py`. TurboQuant now works with SGLang's default backend selection (FlashInfer, Triton, etc.) via dequant-on-read.
+- The pool's `get_key_buffer()` / `get_value_buffer()` methods dequantize on demand, returning standard [pool_size, H, D] BF16 tensors compatible with any attention backend.
+- Fused TurboQuant Triton kernels remain available as opt-in via `--attention-backend turboquant`.
+- Added `"turboquant"` to `ATTENTION_BACKEND_CHOICES` in server_args.py.
 
 ### Step 2 Completion Summary (Phase 3A)
 
 **New files:**
 - `layers/attention/triton_ops/turboquant_decode_attention.py` — Triton two-stage decode kernel (MSE codebook + QJL sign-bit scoring for K, MSE weighted sum for V)
-- `layers/attention/turboquant_backend.py` — TurboQuantAttnBackend (inherits TritonAttnBackend, overrides forward_decode)
 
 **Rewritten:**
 - `mem_cache/turboquant_pool.py` — Now inherits from KVCache directly with compact uint8 packed buffers (no BF16 dequant buffers)
@@ -26,12 +59,11 @@ This document outlines the phased implementation plan for integrating TurboQuant
 **Extended:**
 - `layers/quantization/turboquant/quant_ops.py` — 5 split-channel functions for fractional bit-widths
 - `layers/attention/attention_registry.py` — Registered "turboquant" backend
-- `server_args.py` — Auto-selects turboquant backend when kv_cache_quantization=turboquant
+- `server_args.py` — TurboQuant CLI flags (no longer forces attention backend)
 
-**Remaining for Phase 3B:**
-- Wire split-channel (3.5-bit) decode path in backend forward_decode
-- Autotuning configs for the Triton kernel
-- Triton extend kernel for prefill (currently uses on-demand dequant + standard Triton extend)
+**Remaining:**
+- Run GSM8K and perplexity validation benchmarks (scripts written, need dataset download)
+- Autotuning configs for the Triton kernels
 
 ### Hybrid Architecture Integration
 
@@ -45,13 +77,13 @@ This document outlines the phased implementation plan for integrating TurboQuant
 |---|---|---|
 | Key quantization | TurboQuant_prod | Unbiased inner-product estimation for QK^T attention scores (paper Theorem 2) |
 | Value quantization | TurboQuant_mse | Optimal MSE reconstruction for weighted sum after softmax (paper Theorem 1) |
-| Rotation matrix scope | Per-layer, shared across heads | Heads have different learned projections; sharing is theoretically sound and memory-efficient (256KB/layer) |
-| QJL projection scope | Per-layer, shared across heads | Same rationale as rotation matrix |
+| Rotation method | Randomized Hadamard (FWHT) | O(d log d) compute, O(d) storage. Paper supports any random rotation (Section 3.1). Matches PR #21419. |
+| QJL projection scope | Per-layer, shared across heads, dense Gaussian | Paper Definition 1: S with i.i.d. N(0,1) entries. Still D x D but only needed for prod mode. |
 | Default bit-width | 3.5 bits (configurable) | Matches full-precision quality per paper Table 1; 2.5 bits also supported |
 | Outlier fraction | Configurable (default 12.5%) | Paper's example; selectable via channel magnitude statistics |
-| Phase 1 attention | Dequant-then-FlashAttention | Correct, simple, leverages existing backends with no kernel work |
-| Phase 2 attention | Fused Triton decode kernel | Avoids materializing full dequantized KV; key performance optimization |
-| Rotation matrix init | QR + sign(diag(R)) correction | Haar-uniform orthogonal matrix per paper and confirmed by MLX implementation |
+| Default attention path | Dequant-on-read with any backend | Kernel-agnostic: works with FlashInfer, Triton, etc. Paper doesn't mandate fused kernels. |
+| Opt-in fused attention | `--attention-backend turboquant` | Fused Triton kernels read packed buffers directly — avoids BF16 materialization. Performance optimization. |
+| Extend kernel approach | Quantize-first, unified single-loop | Quantize fresh KV first, then ALL KV from quantized buffers. Matches MLX reference. |
 
 ---
 

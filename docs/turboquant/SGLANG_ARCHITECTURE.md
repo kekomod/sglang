@@ -175,9 +175,21 @@ Key backends:
 1. Save current token's KV to cache: `token_to_kv_pool.set_kv_buffer(...)`
 2. Run FlashInfer decode attention kernel (reads from KV cache)
 
-**For TurboQuant integration:**
-- **Phase 1 (simple):** Override `set_kv_buffer` to quantize on write, `get_key_buffer`/`get_value_buffer` to dequantize on read. Existing FlashInfer/FlashAttention kernels work unchanged with dequantized tensors.
-- **Phase 2 (performant):** Custom attention kernel that operates on quantized data directly, avoiding full dequantization.
+**TurboQuant integration (DONE):**
+
+TurboQuant is **kernel-agnostic** — it works with any attention backend via dequant-on-read:
+- `TurboQuantTokenToKVPool.get_key_buffer()` / `get_value_buffer()` dequantize on demand, returning standard [pool_size, H, D] BF16 tensors
+- Any backend (FlashInfer, Triton, etc.) can use these without modification
+- `--kv-cache-quantization turboquant` does NOT force a specific attention backend
+
+**Opt-in fused kernels** (`--attention-backend turboquant`):
+- `TurboQuantAttnBackend` inherits `TritonAttnBackend`, overrides `forward_decode` and `forward_extend`
+- Reads packed uint8 KV directly — no BF16 materialization
+- Decode: two-stage Triton kernel (score + reduce across KV splits)
+- Extend: single-stage quantize-first kernel (all KV from quantized buffers, online softmax)
+- Both support integer bits (3-bit) and split-channel fractional bits (3.5-bit)
+
+**Rotation:** Randomized Hadamard transform (FWHT) — O(d log d), stores only a sign vector per layer. Query pre-rotation via `hadamard.forward(q)`, output inverse via `hadamard.inverse(o_rot)`. QJL projection (`q @ S^T`) uses a separate dense Gaussian matrix (paper Definition 1).
 
 ---
 
@@ -239,14 +251,18 @@ Relevant args:
 
 ## 10. Critical Integration Summary
 
-| Step | File to Modify | Change |
-|---|---|---|
-| Register method | `quantization/__init__.py` | Add `"turboquant": TurboQuantConfig` |
-| Config class | `quantization/turboquant/config.py` (NEW) | Implement `TurboQuantConfig(QuantizationConfig)` |
-| KV cache method | `quantization/turboquant/kv_cache_method.py` (NEW) | Implement quantized KV management |
-| Memory pool | `mem_cache/turboquant_pool.py` (NEW) | Implement `TurboQuantTokenToKVPool(KVCache)` |
-| Qwen3.5 model | `models/qwen3_5.py` | Pass `quant_config` to `RadixAttention` |
-| Server args | `server_args.py` | Add TurboQuant CLI options |
+| Step | File | Status | Change |
+|---|---|---|---|
+| Register method | `quantization/__init__.py` | DONE | Added `"turboquant": TurboQuantConfig` |
+| Config class | `quantization/turboquant/config.py` | DONE | `TurboQuantConfig(QuantizationConfig)` with fractional bit support |
+| KV cache method | `quantization/turboquant/kv_cache_method.py` | DONE | Attaches config to RadixAttention layers |
+| Memory pool | `mem_cache/turboquant_pool.py` | DONE | `TurboQuantTokenToKVPool(KVCache)` with compact uint8 packed buffers |
+| Decode kernel | `attention/triton_ops/turboquant_decode_attention.py` | DONE | Two-stage Triton kernel (integer + split-channel) |
+| Extend kernel | `attention/triton_ops/turboquant_extend_attention.py` | DONE | Single-stage quantize-first Triton kernel (integer + split-channel) |
+| Backend | `attention/turboquant_backend.py` | DONE | Overrides both forward_decode and forward_extend |
+| Qwen3.5 model | `models/qwen3_5.py` | DONE | Passes `quant_config` to `RadixAttention` |
+| Server args | `server_args.py` | DONE | `--kv-cache-quantization turboquant --turboquant-bits N` |
+| Benchmarks | `benchmark/turboquant/` | DONE | perplexity, needle-in-haystack, GSM8K, master runner |
 | Model runner | `model_executor/model_runner.py` | Instantiate TurboQuant pool |
 | Kernels | `sgl-kernel/csrc/turboquant/` (NEW) | CUDA quantization/attention kernels |
 | Kernel registration | `sgl-kernel/csrc/common_extension.cc` | Register new ops |

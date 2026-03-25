@@ -95,7 +95,7 @@ def unpack_bits(packed: torch.Tensor, bits: int, length: int) -> torch.Tensor:
 
 def mse_quantize(
     x: torch.Tensor,
-    pi: torch.Tensor,
+    hadamard,
     codebook: torch.Tensor,
     bits: int,
 ) -> tuple:
@@ -103,7 +103,7 @@ def mse_quantize(
 
     Args:
         x: Input vectors [N, H, D]
-        pi: Rotation matrix [D, D]
+        hadamard: HadamardTransform instance (or any object with .forward())
         codebook: Centroids [2^bits]
         bits: Bits per coordinate
 
@@ -114,12 +114,12 @@ def mse_quantize(
     norms = torch.linalg.norm(x_f, dim=-1)
     unit = x_f / norms.unsqueeze(-1).clamp(min=_EPS)
 
-    # Rotate
-    rotated = torch.matmul(unit, pi.T)  # [N, H, D]
+    # Rotate via Hadamard transform
+    rotated = hadamard.forward(unit)  # [N, H, padded_D]
 
     # Nearest centroid per coordinate
     distances = (rotated.unsqueeze(-1) - codebook.to(rotated.device)).abs()
-    indices = distances.argmin(dim=-1)  # [N, H, D]
+    indices = distances.argmin(dim=-1)  # [N, H, padded_D]
 
     packed = pack_bits(indices, bits)
     return packed, norms.half()
@@ -128,7 +128,7 @@ def mse_quantize(
 def mse_dequantize(
     packed_indices: torch.Tensor,
     norms: torch.Tensor,
-    pi_t: torch.Tensor,
+    hadamard,
     codebook: torch.Tensor,
     bits: int,
     dim: int,
@@ -138,20 +138,21 @@ def mse_dequantize(
     Args:
         packed_indices: Packed indices [N, H, packed_D]
         norms: Vector norms [N, H]
-        pi_t: Transposed rotation matrix [D, D]
+        hadamard: HadamardTransform instance (or any object with .inverse())
         codebook: Centroids [2^bits]
         bits: Bits per coordinate
-        dim: Head dimension
+        dim: Head dimension (original, pre-padding)
 
     Returns:
         Reconstructed vectors [N, H, D]
     """
-    indices = unpack_bits(packed_indices, bits, dim)
+    padded_dim = getattr(hadamard, 'padded_dim', dim)
+    indices = unpack_bits(packed_indices, bits, padded_dim)
     cb = codebook.to(indices.device)
-    rotated = cb[indices.long()]  # [N, H, D]
+    rotated = cb[indices.long()]  # [N, H, padded_D]
 
-    # Inverse rotate
-    unit = torch.matmul(rotated, pi_t.T)
+    # Inverse rotate via Hadamard
+    unit = hadamard.inverse(rotated)  # [N, H, D]
 
     return norms.unsqueeze(-1).float() * unit
 
@@ -162,7 +163,7 @@ def mse_dequantize(
 
 def prod_quantize(
     x: torch.Tensor,
-    pi: torch.Tensor,
+    hadamard,
     s_matrix: torch.Tensor,
     mse_codebook: torch.Tensor,
     bits: int,
@@ -173,7 +174,7 @@ def prod_quantize(
 
     Args:
         x: Input vectors [N, H, D]
-        pi: Rotation matrix [D, D]
+        hadamard: HadamardTransform instance
         s_matrix: QJL projection matrix [D, D]
         mse_codebook: Centroids for (bits-1)-bit MSE [2^(bits-1)]
         bits: Total bits per coordinate
@@ -183,13 +184,14 @@ def prod_quantize(
     """
     mse_bits = max(bits - 1, 0)
     dim = x.shape[-1]
+    padded_dim = getattr(hadamard, 'padded_dim', dim)
     x_f = x.float()
 
     norms = torch.linalg.norm(x_f, dim=-1)
     unit = x_f / norms.unsqueeze(-1).clamp(min=_EPS)
 
-    # MSE component at (bits-1) bits
-    rotated = torch.matmul(unit, pi.T)
+    # MSE component at (bits-1) bits — rotate via Hadamard
+    rotated = hadamard.forward(unit)  # [N, H, padded_D]
 
     if mse_bits > 0:
         cb = mse_codebook.to(rotated.device)
@@ -197,11 +199,11 @@ def prod_quantize(
         mse_indices = distances.argmin(dim=-1)
         mse_packed = pack_bits(mse_indices, mse_bits)
 
-        # Dequantize MSE to compute residual
+        # Dequantize MSE to compute residual (inverse rotate)
         mse_rotated = cb[mse_indices.long()]
-        mse_unit = torch.matmul(mse_rotated, pi.contiguous())  # pi^T^T = pi
+        mse_unit = hadamard.inverse(mse_rotated)  # [N, H, D]
     else:
-        pw = packed_width(dim, mse_bits)
+        pw = packed_width(padded_dim, mse_bits)
         mse_packed = torch.zeros(
             *x.shape[:-1], pw, dtype=torch.uint8, device=x.device
         )
@@ -260,8 +262,8 @@ def split_channel_mse_quantize(
     x: torch.Tensor,
     lo_indices: torch.Tensor,
     hi_indices: torch.Tensor,
-    pi_lo: torch.Tensor,
-    pi_hi: torch.Tensor,
+    hadamard_lo,
+    hadamard_hi,
     cb_lo: torch.Tensor,
     cb_hi: torch.Tensor,
     lo_bits: int,
@@ -270,12 +272,12 @@ def split_channel_mse_quantize(
     """Split-channel TurboQuant_mse quantization.
 
     Splits x along the last dimension into lo/hi groups, then independently
-    applies mse_quantize to each group with its own rotation and codebook.
+    applies mse_quantize to each group with its own Hadamard transform and codebook.
 
     Args:
         x: Input vectors [N, H, D]
         lo_indices, hi_indices: Channel index tensors from select_outlier_indices
-        pi_lo, pi_hi: Rotation matrices [D_lo, D_lo] and [D_hi, D_hi]
+        hadamard_lo, hadamard_hi: HadamardTransform instances per group
         cb_lo, cb_hi: Codebooks for each group
         lo_bits, hi_bits: Bit-widths for each group
 
@@ -285,8 +287,8 @@ def split_channel_mse_quantize(
     x_lo = x.index_select(-1, lo_indices.to(x.device))
     x_hi = x.index_select(-1, hi_indices.to(x.device))
 
-    lo_packed, lo_norms = mse_quantize(x_lo, pi_lo, cb_lo, lo_bits)
-    hi_packed, hi_norms = mse_quantize(x_hi, pi_hi, cb_hi, hi_bits)
+    lo_packed, lo_norms = mse_quantize(x_lo, hadamard_lo, cb_lo, lo_bits)
+    hi_packed, hi_norms = mse_quantize(x_hi, hadamard_hi, cb_hi, hi_bits)
 
     return lo_packed, lo_norms, hi_packed, hi_norms
 
@@ -299,8 +301,8 @@ def split_channel_mse_dequantize(
     lo_indices: torch.Tensor,
     hi_indices: torch.Tensor,
     restore_order: torch.Tensor,
-    pi_t_lo: torch.Tensor,
-    pi_t_hi: torch.Tensor,
+    hadamard_lo,
+    hadamard_hi,
     cb_lo: torch.Tensor,
     cb_hi: torch.Tensor,
     lo_bits: int,
@@ -317,7 +319,7 @@ def split_channel_mse_dequantize(
         hi_packed, hi_norms: Packed indices and norms for hi group
         lo_indices, hi_indices: Channel index tensors
         restore_order: argsort(cat(lo_indices, hi_indices)) permutation
-        pi_t_lo, pi_t_hi: Transposed rotation matrices
+        hadamard_lo, hadamard_hi: HadamardTransform instances per group
         cb_lo, cb_hi: Codebooks
         lo_bits, hi_bits: Bit-widths
         dim: Original head dimension (lo + hi)
@@ -328,8 +330,8 @@ def split_channel_mse_dequantize(
     d_lo = lo_indices.shape[0]
     d_hi = hi_indices.shape[0]
 
-    lo_recon = mse_dequantize(lo_packed, lo_norms, pi_t_lo, cb_lo, lo_bits, d_lo)
-    hi_recon = mse_dequantize(hi_packed, hi_norms, pi_t_hi, cb_hi, hi_bits, d_hi)
+    lo_recon = mse_dequantize(lo_packed, lo_norms, hadamard_lo, cb_lo, lo_bits, d_lo)
+    hi_recon = mse_dequantize(hi_packed, hi_norms, hadamard_hi, cb_hi, hi_bits, d_hi)
 
     merged = torch.cat([lo_recon, hi_recon], dim=-1)
     return merged.index_select(-1, restore_order.to(merged.device))
@@ -339,8 +341,8 @@ def split_channel_prod_quantize(
     x: torch.Tensor,
     lo_indices: torch.Tensor,
     hi_indices: torch.Tensor,
-    pi_lo: torch.Tensor,
-    pi_hi: torch.Tensor,
+    hadamard_lo,
+    hadamard_hi,
     s_lo: torch.Tensor,
     s_hi: torch.Tensor,
     cb_lo: torch.Tensor,
@@ -355,7 +357,7 @@ def split_channel_prod_quantize(
     Args:
         x: Input vectors [N, H, D]
         lo_indices, hi_indices: Channel splits
-        pi_lo, pi_hi: Per-group rotation matrices
+        hadamard_lo, hadamard_hi: Per-group HadamardTransform instances
         s_lo, s_hi: Per-group QJL projection matrices
         cb_lo, cb_hi: Per-group MSE codebooks (for bits-1)
         lo_bits, hi_bits: Total bits per group
@@ -368,10 +370,10 @@ def split_channel_prod_quantize(
     x_hi = x.index_select(-1, hi_indices.to(x.device))
 
     lo_mse_p, lo_qjl_p, lo_n, lo_rn = prod_quantize(
-        x_lo, pi_lo, s_lo, cb_lo, lo_bits
+        x_lo, hadamard_lo, s_lo, cb_lo, lo_bits
     )
     hi_mse_p, hi_qjl_p, hi_n, hi_rn = prod_quantize(
-        x_hi, pi_hi, s_hi, cb_hi, hi_bits
+        x_hi, hadamard_hi, s_hi, cb_hi, hi_bits
     )
 
     return lo_mse_p, lo_qjl_p, lo_n, lo_rn, hi_mse_p, hi_qjl_p, hi_n, hi_rn
@@ -389,8 +391,8 @@ def split_channel_prod_dequantize(
     lo_indices: torch.Tensor,
     hi_indices: torch.Tensor,
     restore_order: torch.Tensor,
-    pi_t_lo: torch.Tensor,
-    pi_t_hi: torch.Tensor,
+    hadamard_lo,
+    hadamard_hi,
     s_lo: torch.Tensor,
     s_hi: torch.Tensor,
     cb_lo: torch.Tensor,
@@ -411,11 +413,11 @@ def split_channel_prod_dequantize(
 
     lo_recon = prod_dequantize(
         lo_mse_packed, lo_qjl_packed, lo_norms, lo_res_norms,
-        pi_t_lo, s_lo, cb_lo, lo_bits, d_lo,
+        hadamard_lo, s_lo, cb_lo, lo_bits, d_lo,
     )
     hi_recon = prod_dequantize(
         hi_mse_packed, hi_qjl_packed, hi_norms, hi_res_norms,
-        pi_t_hi, s_hi, cb_hi, hi_bits, d_hi,
+        hadamard_hi, s_hi, cb_hi, hi_bits, d_hi,
     )
 
     merged = torch.cat([lo_recon, hi_recon], dim=-1)
@@ -427,7 +429,7 @@ def prod_dequantize(
     qjl_packed: torch.Tensor,
     norms: torch.Tensor,
     residual_norms: torch.Tensor,
-    pi_t: torch.Tensor,
+    hadamard,
     s_matrix: torch.Tensor,
     mse_codebook: torch.Tensor,
     bits: int,
@@ -439,13 +441,14 @@ def prod_dequantize(
         Reconstructed vectors [N, H, D]
     """
     mse_bits = max(bits - 1, 0)
+    padded_dim = getattr(hadamard, 'padded_dim', dim)
 
     # MSE component
     if mse_bits > 0:
-        mse_indices = unpack_bits(mse_packed, mse_bits, dim)
+        mse_indices = unpack_bits(mse_packed, mse_bits, padded_dim)
         cb = mse_codebook.to(mse_indices.device)
         mse_rotated = cb[mse_indices.long()]
-        mse_unit = torch.matmul(mse_rotated, pi_t.T)
+        mse_unit = hadamard.inverse(mse_rotated)  # [N, H, D]
     else:
         mse_unit = torch.zeros(
             *norms.shape, dim, dtype=torch.float32, device=norms.device
