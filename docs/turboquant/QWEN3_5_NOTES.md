@@ -42,7 +42,7 @@ Controlled by config field `full_attention_interval: 4`.
 
 | Parameter | 9B | 27B | 35B-A3B |
 |---|---|---|---|
-| Architecture class | `qwen3_5` (dense) | `qwen3_5` (dense) | `qwen3_5_moe` (MoE) |
+| Architecture class | `qwen3_5_text` (dense) | `qwen3_5_text` (dense) | `qwen3_5_moe_text` (MoE) |
 | Total parameters | 9B | 27B | 35B total, 3B active |
 | Hidden size | 4096 | 5120 | 2048 |
 | Total layers | 32 | 64 | 40 |
@@ -125,7 +125,7 @@ Qwen3.5 applies RoPE to only 25% of the head dimension (64 of 256 dims). The rem
 
 ### 4.5 Q/K Normalization
 
-Qwen3.5 applies RMSNorm to Q and K projections before RoPE (qwen3_5.py line ~680):
+Qwen3.5 applies RMSNorm to Q and K projections before RoPE (qwen3_5.py `_apply_qk_norm` at line ~766, called at line ~809):
 ```python
 q, k = self._apply_qk_norm(q, k)
 ```

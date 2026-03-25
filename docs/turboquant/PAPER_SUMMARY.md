@@ -265,7 +265,7 @@ Model: Llama-3.1-8B-Instruct, sequences 4K-104K tokens, 25% memory compression r
 | PyramidKV | 0.895 |
 | SnapKV | 0.858 |
 
-### 6.3 LongBench-V1 (Section 4.3, Table 1)
+### 6.3 LongBench-E (Section 4.3, Table 1)
 
 Model: Llama-3.1-8B-Instruct
 

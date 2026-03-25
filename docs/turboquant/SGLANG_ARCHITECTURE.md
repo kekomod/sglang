@@ -90,7 +90,7 @@ class Fp8KVCacheMethod(BaseKVCacheMethod):
     pass  # Inherits everything from BaseKVCacheMethod
 ```
 
-The FP8 KV cache is simple — it just stores scale factors. The actual FP8 conversion happens in the attention backend via the `downcast_fp8` kernel.
+The FP8 KV cache is simple — it just stores scale factors. The actual FP8 conversion is handled by setting `store_dtype` to `torch.uint8` within the regular `MHATokenToKVPool` and applying type casting during storage.
 
 **TurboQuant is more complex:** We need to store rotation matrices, codebooks, and manage quantized storage buffers. This likely requires a custom KV cache method that goes beyond `BaseKVCacheMethod`.
 
@@ -135,7 +135,6 @@ class KVCache(ABC):
     def get_key_buffer(self, layer_id) -> torch.Tensor
     def get_value_buffer(self, layer_id) -> torch.Tensor
     def get_kv_buffer(self, layer_id) -> Tuple[torch.Tensor, torch.Tensor]
-    def transfer(self, src_loc, dst_loc, ...)
 ```
 
 ### MHA Implementation
@@ -146,12 +145,12 @@ class MHATokenToKVPool(KVCache):
     # v_buffer[layer]: [pool_size, num_heads, head_dim] in model dtype
 ```
 
-### FP8/FP4 Variants
-- `MHATokenToKVPoolFP8`: Uses `torch.float8_e4m3fn` dtype, applies scales via `downcast_fp8` kernel
-- `MHATokenToKVPoolFP4`: Even more compact storage
+### FP4 Variant
+- `MHATokenToKVPoolFP4`: Compact 4-bit KV storage
+- FP8 is handled within the regular `MHATokenToKVPool` by setting `store_dtype` to `torch.uint8`
 
 ### Hybrid Pool (for Qwen3.5)
-The `HybridTokenToKVPool` wraps separate pools for full-attention and linear-attention layers, handling the layer ID mapping via `_transfer_full_attention_id()`.
+`HybridLinearKVPool` wraps separate pools for full-attention and linear-attention layers, handling the layer ID mapping between global layer IDs and per-type indices.
 
 **For TurboQuant:** Need a new `TurboQuantTokenToKVPool(KVCache)` that stores packed indices, norms, and QJL signs instead of dense FP16 tensors.
 
