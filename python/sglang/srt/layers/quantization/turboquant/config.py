@@ -30,9 +30,9 @@ class TurboQuantConfig(QuantizationConfig):
     Enabled via --kv-cache-quantization turboquant.
     """
 
-    def __init__(self, bits: int = 3, seed: int = 42):
+    def __init__(self, bits: float = 3, seed: int = 42):
         super().__init__()
-        self.bits = int(bits)
+        self.bits = float(bits)
         self.seed = seed
 
     def get_name(self) -> str:

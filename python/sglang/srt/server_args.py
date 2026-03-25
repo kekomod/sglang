@@ -2240,6 +2240,14 @@ class ServerArgs:
         ):  # override the default attention backend
             self.attention_backend = self.prefill_attention_backend
 
+        # Auto-select turboquant backend for turboquant KV cache quantization
+        if getattr(self, "kv_cache_quantization", None) == "turboquant":
+            if self.attention_backend is None:
+                self.attention_backend = "turboquant"
+                logger.info(
+                    "TurboQuant KV cache quantization enabled — using turboquant attention backend"
+                )
+
         # Pick the default attention backend if not specified
         if self.attention_backend is None:
             self.attention_backend = self._get_default_attn_backend(

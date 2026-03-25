@@ -1236,7 +1236,7 @@ class HybridLinearKVPool(KVCache):
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
         kv_cache_quantization: str = None,
-        turboquant_bits: int = 3,
+        turboquant_bits: float = 3,
         turboquant_seed: int = 42,
     ):
         self.size = size

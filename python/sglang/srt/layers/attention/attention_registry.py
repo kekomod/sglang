@@ -241,3 +241,10 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("turboquant")
+def create_turboquant_backend(runner):
+    from sglang.srt.layers.attention.turboquant_backend import TurboQuantAttnBackend
+
+    return TurboQuantAttnBackend(runner)

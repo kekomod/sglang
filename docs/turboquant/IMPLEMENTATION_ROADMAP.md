@@ -10,18 +10,28 @@ This document outlines the phased implementation plan for integrating TurboQuant
 |---|---|---|
 | Phase 1: Core Library | DONE | codebook, rotation, quant_ops, packing all working |
 | Phase 2: SGLang Integration | DONE | Config, KVCacheMethod, TurboQuantTokenToKVPool, CLI args, Qwen3.5 model fix, HybridLinearKVPool integration |
-| Phase 3: Triton Kernels | NOT STARTED | |
+| Phase 3: Triton Kernels | DONE (Phase A) | Triton decode kernel reads packed uint8 KV directly, split-channel codec, compact pool storage, turboquant attention backend |
 | Phase 4: CUDA Kernels | NOT STARTED | |
-| Phase 5: Validation | IN PROGRESS | Server starts, TurboQuant pool initializes (3.1x savings), but garbled output due to dequant buffer invalidation bug |
+| Phase 5: Validation | IN PROGRESS | 3-bit integer path generates coherent output. KV cache: 0.04 GB vs ~3.9 GB BF16. Split-channel decode (3.5-bit) not yet wired. |
 
-### Known Bug: Shared Dequant Buffer
+### Step 2 Completion Summary (Phase 3A)
 
-The `TurboQuantTokenToKVPool` uses a single shared dequant buffer pair for all layers. The `_ensure_dequant()` method skips re-dequantization when `_dequant_layer_id == layer_id`, but `set_kv_buffer()` only writes dequantized data for the newly stored `loc` positions. When a different code path calls `get_kv_buffer()` for the same layer, the buffer contains stale/zero data at positions not recently written. This causes garbled attention output.
+**New files:**
+- `layers/attention/triton_ops/turboquant_decode_attention.py` — Triton two-stage decode kernel (MSE codebook + QJL sign-bit scoring for K, MSE weighted sum for V)
+- `layers/attention/turboquant_backend.py` — TurboQuantAttnBackend (inherits TritonAttnBackend, overrides forward_decode)
 
-**Fix options:**
-1. Always dequant the full buffer on `get_kv_buffer` (simple but slow — O(pool_size * head_dim) per layer per forward)
-2. Track dirty positions per layer and selectively dequant (complex bookkeeping)
-3. Remove the shared buffer optimization and use per-layer dequant buffers (uses more memory but simpler)
+**Rewritten:**
+- `mem_cache/turboquant_pool.py` — Now inherits from KVCache directly with compact uint8 packed buffers (no BF16 dequant buffers)
+
+**Extended:**
+- `layers/quantization/turboquant/quant_ops.py` — 5 split-channel functions for fractional bit-widths
+- `layers/attention/attention_registry.py` — Registered "turboquant" backend
+- `server_args.py` — Auto-selects turboquant backend when kv_cache_quantization=turboquant
+
+**Remaining for Phase 3B:**
+- Wire split-channel (3.5-bit) decode path in backend forward_decode
+- Autotuning configs for the Triton kernel
+- Triton extend kernel for prefill (currently uses on-demand dequant + standard Triton extend)
 
 ### Hybrid Architecture Integration
 
