@@ -329,7 +329,7 @@ class ServerArgs:
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
     kv_cache_quantization: Optional[str] = None  # e.g., "turboquant"
-    turboquant_bits: int = 3
+    turboquant_bits: float = 3.5  # Paper Table 1: 3.5-bit matches full precision
     turboquant_seed: int = 42
     enable_fp32_lm_head: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
@@ -3787,9 +3787,11 @@ class ServerArgs:
         )
         parser.add_argument(
             "--turboquant-bits",
-            type=int,
-            default=3,
-            help="Bits per dimension for TurboQuant KV cache quantization (2, 3, or 4).",
+            type=float,
+            default=3.5,
+            help="Bits per dimension for TurboQuant KV cache quantization. "
+            "Supports integer (2, 3, 4) and half-integer (2.5, 3.5) values. "
+            "Default 3.5 matches full precision per paper Table 1.",
         )
         parser.add_argument(
             "--turboquant-seed",
