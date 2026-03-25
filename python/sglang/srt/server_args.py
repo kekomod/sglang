@@ -328,6 +328,9 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
+    kv_cache_quantization: Optional[str] = None  # e.g., "turboquant"
+    turboquant_bits: int = 3
+    turboquant_seed: int = 42
     enable_fp32_lm_head: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
@@ -3774,6 +3777,25 @@ class ServerArgs:
             default=ServerArgs.kv_cache_dtype,
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
             help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+',
+        )
+        parser.add_argument(
+            "--kv-cache-quantization",
+            type=str,
+            default=None,
+            choices=[None, "turboquant"],
+            help="KV cache quantization method. 'turboquant' enables TurboQuant (arXiv:2504.19874).",
+        )
+        parser.add_argument(
+            "--turboquant-bits",
+            type=int,
+            default=3,
+            help="Bits per dimension for TurboQuant KV cache quantization (2, 3, or 4).",
+        )
+        parser.add_argument(
+            "--turboquant-seed",
+            type=int,
+            default=42,
+            help="Random seed for TurboQuant rotation/projection matrices.",
         )
         parser.add_argument(
             "--enable-fp32-lm-head",
