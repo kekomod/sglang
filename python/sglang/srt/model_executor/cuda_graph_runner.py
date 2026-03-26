@@ -821,8 +821,19 @@ class CudaGraphRunner:
             if memory_saver_adapter.enabled
             else self.device_module.graph
         )
+        # TurboQuant: enable graph mode during capture so set_kv_buffer
+        # only does BF16 scatter (graph-safe), skipping quantization
+        kv_pool = self.model_runner.token_to_kv_pool
+        is_tq = hasattr(kv_pool, '_graph_mode')
+        if is_tq:
+            kv_pool.set_graph_mode(True)
+
         with graph_fn(cuda_graph=graph, pool=pool, stream=stream):
             out = run_once_fn()
+
+        if is_tq:
+            kv_pool.set_graph_mode(False)
+
         return out
 
     def _create_device_graph(self):

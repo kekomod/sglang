@@ -261,9 +261,12 @@ Relevant args:
 | Extend kernel | `attention/triton_ops/turboquant_extend_attention.py` | DONE | Single-stage quantize-first Triton kernel (integer + split-channel) |
 | Backend | `attention/turboquant_backend.py` | DONE | Overrides both forward_decode and forward_extend |
 | Qwen3.5 model | `models/qwen3_5.py` | DONE | Passes `quant_config` to `RadixAttention` |
-| Server args | `server_args.py` | DONE | `--kv-cache-quantization turboquant --turboquant-bits N` |
-| Benchmarks | `benchmark/turboquant/` | DONE | perplexity, needle-in-haystack, GSM8K, master runner |
-| Model runner | `model_executor/model_runner.py` | Instantiate TurboQuant pool |
-| Kernels | `sgl-kernel/csrc/turboquant/` (NEW) | CUDA quantization/attention kernels |
-| Kernel registration | `sgl-kernel/csrc/common_extension.cc` | Register new ops |
-| Build | `sgl-kernel/CMakeLists.txt` | Add CUDA sources |
+| Server args | `server_args.py` | DONE | `--kv-cache-quantization turboquant --turboquant-bits N`. CUDA graphs allowed by default; auto-disabled only for `--attention-backend turboquant` (fused) |
+| Benchmarks | `benchmark/turboquant/` | DONE | perplexity, needle-in-haystack, GSM8K, throughput, master runner |
+| Model runner | `model_executor/model_runner.py` | DONE | Instantiate TurboQuant pool; graph-mode hooks: `set_graph_mode(True)` before replay, `quant_new_tokens()` after |
+| CUDA graph runner | `model_executor/cuda_graph_runner.py` | DONE | `set_graph_mode(True)` during `_capture_graph()` so warmup only does BF16 scatter |
+| Triton FWHT | `quantization/turboquant/triton_fwht.py` | DONE | Forward/inverse FWHT kernels (D=32,64,128,256), replaces torch.compile |
+| Hybrid pool passthrough | `mem_cache/memory_pool.py` | DONE | `HybridLinearKVPool` delegates `_graph_mode`, `set_graph_mode()`, `quant_new_tokens()` to inner pool |
+| Kernels | `sgl-kernel/csrc/turboquant/` (NEW) | Future | CUDA quantization/attention kernels |
+| Kernel registration | `sgl-kernel/csrc/common_extension.cc` | Future | Register new ops |
+| Build | `sgl-kernel/CMakeLists.txt` | Future | Add CUDA sources |

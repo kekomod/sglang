@@ -9,6 +9,7 @@ All ops work on batched tensors of shape [num_tokens, num_heads, head_dim].
 import math
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.turboquant.codebook import packed_width
 
@@ -22,6 +23,9 @@ _EPS = 1e-8
 def pack_bits(values: torch.Tensor, bits: int) -> torch.Tensor:
     """Pack b-bit integer values into uint8 tensor.
 
+    Uses vectorized tensor-level bitwise ops — no Python per-element loops.
+    Supports 1, 2, 3, and 4-bit packing.
+
     Args:
         values: Integer tensor with values in [0, 2^bits). Shape [..., length]
         bits: Bits per value (1, 2, 3, or 4)
@@ -32,31 +36,76 @@ def pack_bits(values: torch.Tensor, bits: int) -> torch.Tensor:
     if bits == 0:
         return torch.zeros(*values.shape[:-1], 0, dtype=torch.uint8, device=values.device)
 
+    batch_shape = values.shape[:-1]
     length = values.shape[-1]
     pw = packed_width(length, bits)
-    flat = values.reshape(-1, length).to(torch.int32)
-    batch = flat.shape[0]
 
-    packed = torch.zeros(batch, pw, dtype=torch.uint8, device=values.device)
+    if bits == 4:
+        # 2 values per byte: low nibble = even indices, high nibble = odd indices
+        v = values.to(torch.int32)
+        even = v[..., 0::2]
+        odd = v[..., 1::2]
+        packed = ((odd << 4) | (even & 0x0F)).to(torch.uint8)
+        # Handle odd length — last value has no pair
+        if length % 2 == 1:
+            last = v[..., -1:].to(torch.uint8)
+            packed = torch.cat([packed, last], dim=-1)
+        return packed.reshape(*batch_shape, pw)
 
-    for idx in range(length):
-        byte_offset = (idx * bits) // 8
-        bit_offset = (idx * bits) % 8
-        val = flat[:, idx]
+    if bits == 2:
+        # 4 values per byte
+        v = values.to(torch.int32)
+        # Pad to multiple of 4
+        pad = (4 - length % 4) % 4
+        if pad > 0:
+            v = F.pad(v, (0, pad))
+        groups = v.reshape(*batch_shape, -1, 4)
+        packed = (
+            (groups[..., 0] & 0x03)
+            | ((groups[..., 1] & 0x03) << 2)
+            | ((groups[..., 2] & 0x03) << 4)
+            | ((groups[..., 3] & 0x03) << 6)
+        ).to(torch.uint8)
+        return packed[..., :pw].reshape(*batch_shape, pw)
 
-        # Write bits into current byte
-        packed[:, byte_offset] |= ((val << bit_offset) & 0xFF).to(torch.uint8)
+    if bits == 1:
+        # 8 values per byte
+        v = values.to(torch.int32)
+        pad = (8 - length % 8) % 8
+        if pad > 0:
+            v = F.pad(v, (0, pad))
+        groups = v.reshape(*batch_shape, -1, 8)
+        packed = groups[..., 0].to(torch.uint8)
+        for i in range(1, 8):
+            packed = packed | (groups[..., i].to(torch.uint8) << i)
+        return packed[..., :pw].reshape(*batch_shape, pw)
 
-        # Handle spill into next byte
-        spill = bit_offset + bits - 8
-        if spill > 0 and byte_offset + 1 < pw:
-            packed[:, byte_offset + 1] |= ((val >> (bits - spill)) & 0xFF).to(torch.uint8)
+    if bits == 3:
+        # 8 values → 3 bytes (24 bits)
+        v = values.to(torch.int32)
+        pad = (8 - length % 8) % 8
+        if pad > 0:
+            v = F.pad(v, (0, pad))
+        groups = v.reshape(*batch_shape, -1, 8)
+        # Pack 8 x 3-bit values into a 24-bit integer
+        packed_24 = groups[..., 0] & 0x07
+        for i in range(1, 8):
+            packed_24 = packed_24 | ((groups[..., i] & 0x07) << (i * 3))
+        # Split 24-bit integer into 3 bytes
+        b0 = (packed_24 & 0xFF).to(torch.uint8)
+        b1 = ((packed_24 >> 8) & 0xFF).to(torch.uint8)
+        b2 = ((packed_24 >> 16) & 0xFF).to(torch.uint8)
+        packed = torch.stack([b0, b1, b2], dim=-1).reshape(*batch_shape, -1)
+        return packed[..., :pw].reshape(*batch_shape, pw)
 
-    return packed.reshape(*values.shape[:-1], pw)
+    raise ValueError(f"Unsupported bit-width: {bits}")
 
 
 def unpack_bits(packed: torch.Tensor, bits: int, length: int) -> torch.Tensor:
     """Unpack uint8 tensor to b-bit integer values.
+
+    Uses vectorized tensor-level bitwise ops — no Python per-element loops.
+    Supports 1, 2, 3, and 4-bit unpacking.
 
     Args:
         packed: Packed uint8 tensor of shape [..., packed_dim]
@@ -69,24 +118,52 @@ def unpack_bits(packed: torch.Tensor, bits: int, length: int) -> torch.Tensor:
     if bits == 0:
         return torch.zeros(*packed.shape[:-1], 0, dtype=torch.int32, device=packed.device)
 
-    flat = packed.reshape(-1, packed.shape[-1]).to(torch.int32)
-    batch = flat.shape[0]
+    batch_shape = packed.shape[:-1]
     mask = (1 << bits) - 1
 
-    unpacked = torch.zeros(batch, length, dtype=torch.int32, device=packed.device)
+    if bits == 4:
+        # 2 values per byte
+        p = packed.to(torch.int32)
+        even = p & 0x0F
+        odd = (p >> 4) & 0x0F
+        unpacked = torch.stack([even, odd], dim=-1).reshape(*batch_shape, -1)
+        return unpacked[..., :length]
 
-    for idx in range(length):
-        byte_offset = (idx * bits) // 8
-        bit_offset = (idx * bits) % 8
-        val = flat[:, byte_offset] >> bit_offset
+    if bits == 2:
+        # 4 values per byte
+        p = packed.to(torch.int32)
+        v0 = p & 0x03
+        v1 = (p >> 2) & 0x03
+        v2 = (p >> 4) & 0x03
+        v3 = (p >> 6) & 0x03
+        unpacked = torch.stack([v0, v1, v2, v3], dim=-1).reshape(*batch_shape, -1)
+        return unpacked[..., :length]
 
-        spill = bit_offset + bits - 8
-        if spill > 0 and byte_offset + 1 < flat.shape[1]:
-            val |= flat[:, byte_offset + 1] << (bits - spill)
+    if bits == 1:
+        # 8 values per byte
+        p = packed.to(torch.int32)
+        vals = [(p >> i) & 1 for i in range(8)]
+        unpacked = torch.stack(vals, dim=-1).reshape(*batch_shape, -1)
+        return unpacked[..., :length]
 
-        unpacked[:, idx] = val & mask
+    if bits == 3:
+        # 3 bytes → 8 values
+        p = packed.to(torch.int32)
+        # Pad to multiple of 3 bytes
+        num_bytes = p.shape[-1]
+        pad = (3 - num_bytes % 3) % 3
+        if pad > 0:
+            p = F.pad(p, (0, pad))
+        # Reshape to groups of 3 bytes
+        groups = p.reshape(*batch_shape, -1, 3)
+        # Reconstruct 24-bit integer
+        packed_24 = groups[..., 0] | (groups[..., 1] << 8) | (groups[..., 2] << 16)
+        # Extract 8 x 3-bit values
+        vals = [(packed_24 >> (i * 3)) & 0x07 for i in range(8)]
+        unpacked = torch.stack(vals, dim=-1).reshape(*batch_shape, -1)
+        return unpacked[..., :length]
 
-    return unpacked.reshape(*packed.shape[:-1], length)
+    raise ValueError(f"Unsupported bit-width: {bits}")
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +195,7 @@ def mse_quantize(
     rotated = hadamard.forward(unit)  # [N, H, padded_D]
 
     # Nearest centroid per coordinate
-    distances = (rotated.unsqueeze(-1) - codebook.to(rotated.device)).abs()
+    distances = (rotated.unsqueeze(-1) - codebook).abs()
     indices = distances.argmin(dim=-1)  # [N, H, padded_D]
 
     packed = pack_bits(indices, bits)
@@ -148,7 +225,7 @@ def mse_dequantize(
     """
     padded_dim = getattr(hadamard, 'padded_dim', dim)
     indices = unpack_bits(packed_indices, bits, padded_dim)
-    cb = codebook.to(indices.device)
+    cb = codebook
     rotated = cb[indices.long()]  # [N, H, padded_D]
 
     # Inverse rotate via Hadamard
@@ -194,13 +271,12 @@ def prod_quantize(
     rotated = hadamard.forward(unit)  # [N, H, padded_D]
 
     if mse_bits > 0:
-        cb = mse_codebook.to(rotated.device)
-        distances = (rotated.unsqueeze(-1) - cb).abs()
+        distances = (rotated.unsqueeze(-1) - mse_codebook).abs()
         mse_indices = distances.argmin(dim=-1)
         mse_packed = pack_bits(mse_indices, mse_bits)
 
         # Dequantize MSE to compute residual (inverse rotate)
-        mse_rotated = cb[mse_indices.long()]
+        mse_rotated = mse_codebook[mse_indices.long()]
         mse_unit = hadamard.inverse(mse_rotated)  # [N, H, D]
     else:
         pw = packed_width(padded_dim, mse_bits)
@@ -284,8 +360,9 @@ def split_channel_mse_quantize(
     Returns:
         (lo_packed, lo_norms, hi_packed, hi_norms)
     """
-    x_lo = x.index_select(-1, lo_indices.to(x.device))
-    x_hi = x.index_select(-1, hi_indices.to(x.device))
+    dev = x.device
+    x_lo = x.index_select(-1, lo_indices.to(dev))
+    x_hi = x.index_select(-1, hi_indices.to(dev))
 
     lo_packed, lo_norms = mse_quantize(x_lo, hadamard_lo, cb_lo, lo_bits)
     hi_packed, hi_norms = mse_quantize(x_hi, hadamard_hi, cb_hi, hi_bits)
@@ -366,8 +443,9 @@ def split_channel_prod_quantize(
         (lo_mse_packed, lo_qjl_packed, lo_norms, lo_res_norms,
          hi_mse_packed, hi_qjl_packed, hi_norms, hi_res_norms)
     """
-    x_lo = x.index_select(-1, lo_indices.to(x.device))
-    x_hi = x.index_select(-1, hi_indices.to(x.device))
+    dev = x.device
+    x_lo = x.index_select(-1, lo_indices.to(dev))
+    x_hi = x.index_select(-1, hi_indices.to(dev))
 
     lo_mse_p, lo_qjl_p, lo_n, lo_rn = prod_quantize(
         x_lo, hadamard_lo, s_lo, cb_lo, lo_bits
@@ -446,8 +524,7 @@ def prod_dequantize(
     # MSE component
     if mse_bits > 0:
         mse_indices = unpack_bits(mse_packed, mse_bits, padded_dim)
-        cb = mse_codebook.to(mse_indices.device)
-        mse_rotated = cb[mse_indices.long()]
+        mse_rotated = mse_codebook[mse_indices.long()]
         mse_unit = hadamard.inverse(mse_rotated)  # [N, H, D]
     else:
         mse_unit = torch.zeros(
@@ -462,7 +539,7 @@ def prod_dequantize(
     qjl_unit = (
         scale
         * residual_norms.unsqueeze(-1).float()
-        * torch.matmul(signs, s_matrix.to(signs.device))
+        * torch.matmul(signs, s_matrix)
     )
 
     return norms.unsqueeze(-1).float() * (mse_unit + qjl_unit)

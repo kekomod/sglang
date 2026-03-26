@@ -12,6 +12,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+try:
+    from sglang.srt.layers.quantization.turboquant.triton_fwht import (
+        triton_fwht_forward,
+        triton_fwht_inverse,
+    )
+
+    _TRITON_FWHT_AVAILABLE = True
+except ImportError:
+    _TRITON_FWHT_AVAILABLE = False
+
 
 def _next_power_of_2(n: int) -> int:
     """Return the smallest power of 2 >= n."""
@@ -51,6 +61,13 @@ class HadamardTransform:
         self.signs = _generate_random_signs(self.padded_dim, seed, device)
         self.scale = 1.0 / math.sqrt(self.padded_dim)
         self.device = device
+        self._use_triton = _TRITON_FWHT_AVAILABLE and torch.device(device).type == "cuda"
+
+        # Warm up Triton kernels to trigger JIT compilation before real data
+        if self._use_triton:
+            dummy = torch.zeros(1, self.padded_dim, device=device)
+            triton_fwht_forward(dummy, self.signs, self.padded_dim, self.scale)
+            triton_fwht_inverse(dummy, self.signs, self.padded_dim, self.dim, self.scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply randomized Hadamard: y = scale * H * diag(signs) * x.
@@ -60,6 +77,9 @@ class HadamardTransform:
         Returns:
             (..., padded_dim) tensor of rotated coordinates
         """
+        if self._use_triton and x.is_cuda:
+            return triton_fwht_forward(x, self.signs, self.padded_dim, self.scale)
+
         orig_shape = x.shape
         d = orig_shape[-1]
 
@@ -82,6 +102,9 @@ class HadamardTransform:
         Full inverse = diag(signs) * (1/d) * H * (y / scale)
         But scale = 1/sqrt(d), so (1/d) * (1/scale) = 1/sqrt(d) = scale.
         """
+        if self._use_triton and y.is_cuda:
+            return triton_fwht_inverse(y, self.signs, self.padded_dim, self.dim, self.scale)
+
         x = self._fwht(y.float()) * self.scale
         x = x * self.signs
         return x[..., :self.dim]
@@ -94,19 +117,28 @@ class HadamardTransform:
 
     @staticmethod
     def _fwht(x: torch.Tensor) -> torch.Tensor:
-        """Fast Walsh-Hadamard Transform along the last dimension."""
-        orig_shape = x.shape
-        n = orig_shape[-1]
-        x = x.reshape(-1, n).float()
-        h = 1
-        while h < n:
-            x = x.view(-1, n // (2 * h), 2, h)
-            a = x[:, :, 0, :]
-            b = x[:, :, 1, :]
-            x = torch.stack([a + b, a - b], dim=2)
-            x = x.view(-1, n)
-            h *= 2
-        return x.view(orig_shape)
+        """Fast Walsh-Hadamard Transform along the last dimension.
+
+        Uses in-place butterfly operations to avoid per-iteration tensor
+        allocations (no torch.stack). Wrapped in torch.compile for fusion.
+        """
+        return _fwht_impl(x)
+
+
+def _fwht_impl(x: torch.Tensor) -> torch.Tensor:
+    """FWHT fallback (CPU) — in-place butterfly, no torch.stack per iteration."""
+    orig_shape = x.shape
+    n = orig_shape[-1]
+    x = x.reshape(-1, n).float().clone()
+    h = 1
+    while h < n:
+        x_view = x.view(-1, n // (2 * h), 2, h)
+        a = x_view[:, :, 0, :].clone()
+        b = x_view[:, :, 1, :]
+        x_view[:, :, 0, :] = a + b
+        x_view[:, :, 1, :] = a - b
+        h *= 2
+    return x.view(orig_shape)
 
 
 @lru_cache(maxsize=None)

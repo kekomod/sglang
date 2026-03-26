@@ -906,6 +906,51 @@ def test_split_extend_vs_reference():
 
 
 # ---------------------------------------------------------------------------
+# Test: Triton FWHT roundtrip
+# ---------------------------------------------------------------------------
+
+def test_triton_fwht_roundtrip():
+    """Verify Triton FWHT forward/inverse roundtrip and match against reference."""
+    from sglang.srt.layers.quantization.turboquant.triton_fwht import (
+        triton_fwht_forward,
+        triton_fwht_inverse,
+    )
+    from sglang.srt.layers.quantization.turboquant.rotation import _fwht_impl
+
+    device = "cuda"
+    torch.manual_seed(42)
+    max_err_all = 0.0
+
+    for D in [32, 64, 128, 256]:
+        x = torch.randn(4, 8, D, device=device, dtype=torch.float32)
+        ht = HadamardTransform(D, seed=42, device=device)
+
+        # Forward via Triton
+        y_triton = triton_fwht_forward(x, ht.signs, ht.padded_dim, ht.scale)
+
+        # Forward via reference (_fwht_impl path)
+        import torch.nn.functional as Fref
+        x_padded = x.float()
+        if D < ht.padded_dim:
+            x_padded = Fref.pad(x_padded, (0, ht.padded_dim - D))
+        x_signed = x_padded * ht.signs
+        y_ref = _fwht_impl(x_signed) * ht.scale
+
+        # Check forward matches reference
+        fwd_err = (y_triton - y_ref).abs().max().item()
+        assert fwd_err < 1e-5, f"D={D}: forward error {fwd_err:.2e} >= 1e-5"
+
+        # Roundtrip: forward then inverse
+        x_back = triton_fwht_inverse(y_triton, ht.signs, ht.padded_dim, D, ht.scale)
+        rt_err = (x_back - x).abs().max().item()
+        assert rt_err < 1e-5, f"D={D}: roundtrip error {rt_err:.2e} >= 1e-5"
+
+        max_err_all = max(max_err_all, fwd_err, rt_err)
+
+    return f"max_abs_err={max_err_all:.2e} (D=32,64,128,256)"
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -921,6 +966,7 @@ ALL_TESTS = [
     test_extend_causal_mask,
     test_extend_variable_batch,
     test_split_extend_vs_reference,
+    test_triton_fwht_roundtrip,
 ]
 
 

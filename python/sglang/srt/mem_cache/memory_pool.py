@@ -1445,6 +1445,22 @@ class HybridLinearKVPool(KVCache):
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
 
+    # ------------------------------------------------------------------
+    # TurboQuant CUDA graph support — passthrough to full_kv_pool
+    # ------------------------------------------------------------------
+
+    @property
+    def _graph_mode(self):
+        return getattr(self.full_kv_pool, '_graph_mode', False)
+
+    def set_graph_mode(self, enabled: bool):
+        if hasattr(self.full_kv_pool, 'set_graph_mode'):
+            self.full_kv_pool.set_graph_mode(enabled)
+
+    def quant_new_tokens(self, loc: torch.Tensor):
+        if hasattr(self.full_kv_pool, 'quant_new_tokens'):
+            self.full_kv_pool.quant_new_tokens(loc)
+
 
 class MLATokenToKVPool(KVCache):
     def __init__(

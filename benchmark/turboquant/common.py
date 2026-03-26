@@ -32,7 +32,6 @@ SERVER_CONFIGS = {
         "args": [
             "--kv-cache-quantization", "turboquant",
             "--turboquant-bits", "3",
-            "--disable-cuda-graph",
         ],
     },
     "turboquant_3.5bit": {
@@ -40,6 +39,22 @@ SERVER_CONFIGS = {
         "args": [
             "--kv-cache-quantization", "turboquant",
             "--turboquant-bits", "3.5",
+        ],
+    },
+    "turboquant_3.5bit_no_graph": {
+        "name": "TurboQuant 3.5-bit (no graph)",
+        "args": [
+            "--kv-cache-quantization", "turboquant",
+            "--turboquant-bits", "3.5",
+            "--disable-cuda-graph",
+        ],
+    },
+    "turboquant_3.5bit_fused": {
+        "name": "TurboQuant 3.5-bit (fused)",
+        "args": [
+            "--kv-cache-quantization", "turboquant",
+            "--turboquant-bits", "3.5",
+            "--attention-backend", "turboquant",
             "--disable-cuda-graph",
         ],
     },

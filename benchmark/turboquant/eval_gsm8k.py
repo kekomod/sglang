@@ -93,6 +93,9 @@ def run_gsm8k_benchmark(
             temperature=0.0,
             stop=["Question", "Assistant:", "<|separator|>"],
         )
+        # Strip <think>...</think> reasoning if present (Qwen3.5)
+        if "</think>" in response:
+            response = response.split("</think>")[-1]
         predictions[idx] = response
 
     # Parallel dispatch

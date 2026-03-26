@@ -4,7 +4,7 @@ This document outlines the phased implementation plan for integrating TurboQuant
 
 ---
 
-## Current Status (2026-03-25)
+## Current Status (2026-03-27)
 
 | Phase | Status | Notes |
 |---|---|---|
@@ -13,7 +13,10 @@ This document outlines the phased implementation plan for integrating TurboQuant
 | Phase 3A: Triton Decode Kernel | DONE | Triton decode kernel reads packed uint8 KV directly, split-channel codec, compact pool storage |
 | Phase 3B: Triton Extend Kernel | DONE | Fused extend/prefill kernel reads ALL KV from quantized buffers (quantize-first approach). Both integer and split-channel paths. |
 | Phase 4: Hadamard + Kernel-Agnostic | DONE | Replaced QR rotation with Fast Walsh-Hadamard Transform (O(d log d), O(d) storage). Removed forced backend — TurboQuant now works with any attention backend via dequant-on-read. Fused kernels opt-in via `--attention-backend turboquant`. |
-| Phase 5: Validation | PARTIAL | 11/11 kernel tests pass. 6/6 server tests pass (fused). Needle-in-haystack: 19/20 = 95% at 3.5-bit (meets target). GSM8K and perplexity benchmarks written but not yet run. |
+| Phase 5: Validation | PARTIAL | 12/12 kernel tests pass. 6/6 server tests pass (with and without CUDA graphs). Needle-in-haystack: 19/20 = 95% at 3.5-bit (meets target). GSM8K and perplexity benchmarks written but not yet run. |
+| Phase 5B: Performance Fixes | DONE | Vectorized pack/unpack (no Python loops), eliminated host-to-device copies, GPU-init tensors. |
+| Phase 6: Triton FWHT Kernel | DONE | Dedicated Triton forward/inverse FWHT kernels replace torch.compile. Graph-safe, no JIT warmup delay. Supports D=32,64,128,256. Roundtrip error 4.77e-07. |
+| Phase 7: CUDA Graph Support | DONE | F2 approach: BF16 workspace mirrors packed storage. Attention reads BF16 during graph capture/replay. Quant/dequant runs outside graph. Throughput: 35 tok/s (0.76x baseline), up from 19 tok/s (0.40x) without graphs. |
 
 ### Step 3 Completion Summary (Phase 3B)
 
@@ -84,6 +87,9 @@ The backend quantizes fresh K/V into the pool BEFORE calling the extend kernel. 
 | Default attention path | Dequant-on-read with any backend | Kernel-agnostic: works with FlashInfer, Triton, etc. Paper doesn't mandate fused kernels. |
 | Opt-in fused attention | `--attention-backend turboquant` | Fused Triton kernels read packed buffers directly — avoids BF16 materialization. Performance optimization. |
 | Extend kernel approach | Quantize-first, unified single-loop | Quantize fresh KV first, then ALL KV from quantized buffers. Matches MLX reference. |
+| Pack/unpack method | Vectorized tensor bitwise ops | Replaced Python per-element loops (128 iter) with tensor-level group ops (7-8 iter). Follows SGLang PR #21419 pattern. |
+| CUDA graph strategy | BF16 workspace (F2 approach, Phase 7) | Attention reads BF16 workspace during graph. Quant/dequant runs outside graph. Fused backend (`--attention-backend turboquant`) auto-disables graphs. |
+| FWHT compilation | Dedicated Triton kernel (Phase 6) | Forward/inverse kernels with butterfly stages. Graph-safe, no torch.compile warmup. CPU fallback via _fwht_impl. |
 
 ---
 
@@ -274,6 +280,67 @@ Port critical Triton kernels to CUDA for maximum performance:
 
 ---
 
+## Phase 6: Triton FWHT Kernel — DONE (see HANDOFF_PHASE_E.md)
+
+Replaced `torch.compile`-wrapped Python FWHT with dedicated Triton kernels.
+
+**Completed:**
+- `triton_fwht.py`: `triton_fwht_forward_kernel` and `triton_fwht_inverse_kernel` with butterfly stages using `tl.debug_barrier()` between stages. Supports D=32,64,128,256.
+- `rotation.py`: Auto-dispatches to Triton on CUDA, falls back to `_fwht_impl` on CPU. JIT warmup in `__init__` ensures consistent results from first call.
+- 12/12 kernel tests pass. Roundtrip error: 4.77e-07.
+
+---
+
+## Phase 7: CUDA Graph Support — DONE (see HANDOFF_PHASE_F.md)
+
+Re-enabled CUDA graphs using the F2 (BF16 workspace) approach.
+
+**Completed:**
+- `turboquant_pool.py`: Per-layer BF16 workspace buffers (`k_workspace`, `v_workspace`), `_graph_mode` flag, dual-write `set_kv_buffer`, mode-aware `get_key/value_buffer`, `quant_new_tokens()` for post-graph quantization.
+- `model_runner.py`: `set_graph_mode(True)` before graph replay, `quant_new_tokens(out_cache_loc)` after.
+- `cuda_graph_runner.py`: `set_graph_mode(True)` during `_capture_graph()` so warmup runs only do BF16 scatter.
+- `server_args.py`: Auto-disable only for fused backend (`--attention-backend turboquant`). Default FlashInfer backend allows CUDA graphs.
+- `memory_pool.py`: `HybridLinearKVPool` passthrough for `_graph_mode`, `set_graph_mode()`, `quant_new_tokens()`.
+- Throughput: 35.2 tok/s (0.76x baseline), up from 18.6 tok/s (0.40x) without graphs.
+
+**Future optimization (F1):** Make quant/dequant ops fully graph-safe to eliminate BF16 workspace memory overhead.
+
+---
+
+## Phase 8: Fused Kernel Optimization (see HANDOFF_PHASE_G.md)
+
+Fuse query rotation (FWHT + QJL projection) into the attention kernels to eliminate Python overhead between kernel launches. Reduces per-layer kernel launches from 5+ to 2-3. Requires inline FWHT helper for Triton.
+
+**Key deliverables:**
+- Fused decode kernel with inline rotation
+- Fused extend kernel with inline query rotation (keep quantize-first for KV)
+- Measurable reduction in per-token decode latency
+
+---
+
+## Phase 9: Rotated-Space Value Accumulation (see HANDOFF_PHASE_H.md)
+
+Exploit linearity of inverse Hadamard to compute value weighted-sum in rotated space, reducing inverse Hadamard calls from O(T) to O(1) per head per layer. For T=1000 and d=128, this is roughly a 7x reduction in value-side compute.
+
+**Key deliverables:**
+- Verify decode/extend kernels already accumulate in rotated space (likely already done)
+- Ensure inverse Hadamard applied once on output, not per-token
+- Optional `get_value_buffer_rotated()` for non-fused path
+
+---
+
+## Phase 10: Hardening & Edge Cases (see HANDOFF_PHASE_I.md)
+
+Final smoothing pass for production readiness. Workspace lifecycle correctness, defensive error handling, CPU offload incompatibility messaging, graph mode context manager, prefix cache consistency verification, memory reporting.
+
+**Key deliverables:**
+- Each item requires a decision about whether to address (cost vs likelihood)
+- Graph mode context manager (try/finally safety)
+- CPU offload error message
+- Optional debug assertions for workspace consistency
+
+---
+
 ## New Files Summary
 
 | File | Phase | Purpose |
@@ -287,6 +354,7 @@ Port critical Triton kernels to CUDA for maximum performance:
 | `quantization/turboquant/packing.py` | 1 | Bit-packing utilities |
 | `quantization/turboquant/outlier.py` | 1 | Outlier channel handling |
 | `quantization/turboquant/triton_kernels.py` | 3 | Triton GPU kernels |
+| `quantization/turboquant/triton_fwht.py` | 6 | Triton FWHT forward/inverse kernels (D=32,64,128,256) |
 | `mem_cache/turboquant_pool.py` | 2 | Quantized KV memory pool |
 | `sgl-kernel/csrc/turboquant/*.cu` | 4 | CUDA kernels |
 | `tests/test_turboquant_*.py` | 1-5 | Test suite |
@@ -297,7 +365,9 @@ Port critical Triton kernels to CUDA for maximum performance:
 |---|---|---|
 | `quantization/__init__.py` | 2 | Register TurboQuantConfig |
 | `models/qwen3_5.py` | 2 | Pass quant_config to RadixAttention |
-| `server_args.py` | 2 | CLI arguments |
-| `model_executor/model_runner.py` | 2 | Memory pool instantiation |
+| `server_args.py` | 2, 7 | CLI arguments; CUDA graph auto-disable for fused backend only |
+| `model_executor/model_runner.py` | 2, 7 | Memory pool instantiation; graph-mode hooks around replay |
+| `model_executor/cuda_graph_runner.py` | 7 | Graph-mode during capture |
+| `mem_cache/memory_pool.py` | 7 | HybridLinearKVPool graph-mode passthrough |
 | `sgl-kernel/csrc/common_extension.cc` | 4 | Kernel registration |
 | `sgl-kernel/CMakeLists.txt` | 4 | Build configuration |

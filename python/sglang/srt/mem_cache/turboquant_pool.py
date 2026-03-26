@@ -93,6 +93,17 @@ class TurboQuantTokenToKVPool(KVCache):
         else:
             self._init_integer(total_slots)
 
+        # BF16 workspace for CUDA graph mode — mirrors packed storage
+        self.k_workspace = [
+            torch.zeros(total_slots, head_num, head_dim, dtype=torch.bfloat16, device=device)
+            for _ in range(layer_num)
+        ]
+        self.v_workspace = [
+            torch.zeros(total_slots, head_num, head_dim, dtype=torch.bfloat16, device=device)
+            for _ in range(layer_num)
+        ]
+        self._graph_mode = False
+
         self._finalize_allocation_log(size)
 
     # ------------------------------------------------------------------
@@ -106,13 +117,13 @@ class TurboQuantTokenToKVPool(KVCache):
         self.lo_bits = lo_bits
         self.hi_bits = hi_bits
 
-        # Channel split
+        # Channel split — move to device at init to avoid runtime host→device copies
         lo_indices, hi_indices = select_outlier_indices(self.head_dim, bits)
-        self.lo_indices = lo_indices  # CPU tensors
-        self.hi_indices = hi_indices
+        self.lo_indices = lo_indices.to(self.device)
+        self.hi_indices = hi_indices.to(self.device)
         self.restore_order = torch.argsort(
             torch.cat([lo_indices, hi_indices])
-        )
+        ).to(self.device)
         d_lo = lo_indices.shape[0]
         d_hi = hi_indices.shape[0]
         self.d_lo = d_lo
@@ -248,6 +259,33 @@ class TurboQuantTokenToKVPool(KVCache):
         self.v_norms = _alloc_fp16()
 
     # ------------------------------------------------------------------
+    # CUDA graph mode control
+    # ------------------------------------------------------------------
+
+    def set_graph_mode(self, enabled: bool):
+        """Enable/disable CUDA graph mode.
+
+        In graph mode, set_kv_buffer only writes to BF16 workspace (graph-safe
+        indexed scatter) and skips quantization. After graph replay, call
+        quant_new_tokens() to quantize the workspace into packed storage.
+        """
+        self._graph_mode = enabled
+
+    def quant_new_tokens(self, loc: torch.Tensor):
+        """Quantize newly generated tokens from BF16 workspace into packed storage.
+
+        Called after CUDA graph replay to persist the BF16 workspace data
+        into the compact quantized buffers.
+        """
+        for li in range(self.layer_num):
+            k = self.k_workspace[li][loc]  # [batch, H, D] bf16
+            v = self.v_workspace[li][loc]  # [batch, H, D] bf16
+            if self.is_split:
+                self._set_kv_split(li, loc, k, v)
+            else:
+                self._set_kv_integer(li, loc, k, v)
+
+    # ------------------------------------------------------------------
     # set_kv_buffer — quantize and store compactly
     # ------------------------------------------------------------------
 
@@ -267,10 +305,16 @@ class TurboQuantTokenToKVPool(KVCache):
         k = cache_k.view(-1, self.head_num, self.head_dim)
         v = cache_v.view(-1, self.head_num, self.head_dim)
 
-        if self.is_split:
-            self._set_kv_split(li, loc, k, v)
-        else:
-            self._set_kv_integer(li, loc, k, v)
+        # Always write BF16 workspace (graph-safe indexed scatter)
+        self.k_workspace[li][loc] = k.to(torch.bfloat16)
+        self.v_workspace[li][loc] = v.to(torch.bfloat16)
+
+        # Quantize to packed storage only outside graph capture
+        if not self._graph_mode:
+            if self.is_split:
+                self._set_kv_split(li, loc, k, v)
+            else:
+                self._set_kv_integer(li, loc, k, v)
 
     def _set_kv_split(self, li: int, loc: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         # Keys (prod quantize per group)
@@ -371,6 +415,10 @@ class TurboQuantTokenToKVPool(KVCache):
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         """Dequantize the entire key buffer for a layer. Returns [pool_size+page, H, D]."""
+        if self._graph_mode:
+            li = layer_id - self.start_layer
+            return self.k_workspace[li]
+
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         li = layer_id - self.start_layer
@@ -397,6 +445,10 @@ class TurboQuantTokenToKVPool(KVCache):
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
         """Dequantize the entire value buffer for a layer. Returns [pool_size+page, H, D]."""
+        if self._graph_mode:
+            li = layer_id - self.start_layer
+            return self.v_workspace[li]
+
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         li = layer_id - self.start_layer
@@ -444,6 +496,9 @@ class TurboQuantTokenToKVPool(KVCache):
                 self.v_hi_packed[li][tgt_loc] = self.v_hi_packed[li][src_loc]
                 self.v_lo_norms[li][tgt_loc] = self.v_lo_norms[li][src_loc]
                 self.v_hi_norms[li][tgt_loc] = self.v_hi_norms[li][src_loc]
+                # Workspace buffers
+                self.k_workspace[li][tgt_loc] = self.k_workspace[li][src_loc]
+                self.v_workspace[li][tgt_loc] = self.v_workspace[li][src_loc]
         else:
             for li in range(self.layer_num):
                 self.k_mse_packed[li][tgt_loc] = self.k_mse_packed[li][src_loc]
@@ -452,6 +507,9 @@ class TurboQuantTokenToKVPool(KVCache):
                 self.k_res_norms[li][tgt_loc] = self.k_res_norms[li][src_loc]
                 self.v_packed[li][tgt_loc] = self.v_packed[li][src_loc]
                 self.v_norms[li][tgt_loc] = self.v_norms[li][src_loc]
+                # Workspace buffers
+                self.k_workspace[li][tgt_loc] = self.k_workspace[li][src_loc]
+                self.v_workspace[li][tgt_loc] = self.v_workspace[li][src_loc]
 
     # ------------------------------------------------------------------
     # get_kv_size_bytes — total memory usage
@@ -491,5 +549,10 @@ class TurboQuantTokenToKVPool(KVCache):
                     self.v_packed[li].nbytes
                     + self.v_norms[li].nbytes
                 )
+
+        # Add workspace buffer sizes
+        for li in range(self.layer_num):
+            k_bytes += self.k_workspace[li].nbytes
+            v_bytes += self.v_workspace[li].nbytes
 
         return k_bytes, v_bytes

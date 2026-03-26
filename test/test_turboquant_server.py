@@ -204,6 +204,10 @@ def main():
         print(f"SERVER NOT RUNNING at {BASE_URL} — skipping all tests")
         sys.exit(1)
 
+    # Warmup: triggers CUDA graph capture and Triton kernel JIT so that
+    # subsequent tests run on stable, compiled code paths.
+    generate("Warmup", max_new_tokens=5, temperature=0.0)
+
     passed = 0
     failed = 0
     for test_fn in ALL_TESTS:
