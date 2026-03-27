@@ -613,6 +613,7 @@ class ModelRunnerKVCacheMixin:
                     kv_cache_quantization=getattr(self.server_args, "kv_cache_quantization", None),
                     turboquant_bits=getattr(self.server_args, "turboquant_bits", 3),
                     turboquant_seed=getattr(self.server_args, "turboquant_seed", 42),
+                    use_workspace=(getattr(self.server_args, "attention_backend", None) != "turboquant"),
                     **extra_args,
                 )
             elif getattr(self.server_args, "kv_cache_quantization", None) == "turboquant":
@@ -632,6 +633,7 @@ class ModelRunnerKVCacheMixin:
                     turboquant_seed=getattr(self.server_args, "turboquant_seed", 42),
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                    use_workspace=(getattr(self.server_args, "attention_backend", None) != "turboquant"),
                 )
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):

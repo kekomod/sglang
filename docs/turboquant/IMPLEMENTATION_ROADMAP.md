@@ -16,7 +16,7 @@ This document outlines the phased implementation plan for integrating TurboQuant
 | Phase 5: Validation | PARTIAL | 12/12 kernel tests pass. 6/6 server tests pass (with and without CUDA graphs). Needle-in-haystack: 19/20 = 95% at 3.5-bit (meets target). GSM8K and perplexity benchmarks written but not yet run. |
 | Phase 5B: Performance Fixes | DONE | Vectorized pack/unpack (no Python loops), eliminated host-to-device copies, GPU-init tensors. |
 | Phase 6: Triton FWHT Kernel | DONE | Dedicated Triton forward/inverse FWHT kernels replace torch.compile. Graph-safe, no JIT warmup delay. Supports D=32,64,128,256. Roundtrip error 4.77e-07. |
-| Phase 7: CUDA Graph Support | DONE | F2 approach: BF16 workspace mirrors packed storage. Attention reads BF16 during graph capture/replay. Quant/dequant runs outside graph. Throughput: 35 tok/s (0.76x baseline), up from 19 tok/s (0.40x) without graphs. |
+| Phase 7: CUDA Graph Support | DONE | F1: quant verified graph-safe, runs inside CUDA graph. Workspace conditional (fused=none, FlashInfer=BF16). Throughput: 47.0 tok/s = 1.00x baseline. Piecewise graphs tested on Qwen2.5-3B. |
 
 ### Step 3 Completion Summary (Phase 3B)
 

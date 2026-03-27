@@ -1,6 +1,6 @@
-# Phase F Handoff: CUDA Graph Support — COMPLETED (2026-03-27, F2 approach)
+# Phase F Handoff: CUDA Graph Support — COMPLETED (2026-03-27, F1+F2)
 
-> **Status:** F2 (BF16 workspace) implemented. CUDA graphs enabled by default for FlashInfer backend. Throughput: 35.2 tok/s (0.76x baseline). F1 (full graph-safe) remains as future optimization to eliminate BF16 workspace memory overhead.
+> **Status:** Both F1 and F2 implemented. Quant ops verified graph-safe — quantization runs inside CUDA graphs. Workspace conditional: fused backend has no workspace (~7GB savings), FlashInfer backend keeps BF16 workspace. Throughput: 47.0 tok/s = 1.00x baseline (all configs). Piecewise graphs tested on Qwen2.5-3B (3/3 pass).
 
 ## Context
 

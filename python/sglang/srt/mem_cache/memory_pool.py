@@ -1238,6 +1238,7 @@ class HybridLinearKVPool(KVCache):
         kv_cache_quantization: str = None,
         turboquant_bits: float = 3,
         turboquant_seed: int = 42,
+        use_workspace: bool = True,
     ):
         self.size = size
         self.dtype = dtype
@@ -1270,6 +1271,7 @@ class HybridLinearKVPool(KVCache):
                     enable_memory_saver=enable_memory_saver,
                     turboquant_bits=turboquant_bits,
                     turboquant_seed=turboquant_seed,
+                    use_workspace=use_workspace,
                 )
             else:
                 TokenToKVPoolClass = MHATokenToKVPool
@@ -1456,10 +1458,6 @@ class HybridLinearKVPool(KVCache):
     def set_graph_mode(self, enabled: bool):
         if hasattr(self.full_kv_pool, 'set_graph_mode'):
             self.full_kv_pool.set_graph_mode(enabled)
-
-    def quant_new_tokens(self, loc: torch.Tensor):
-        if hasattr(self.full_kv_pool, 'quant_new_tokens'):
-            self.full_kv_pool.quant_new_tokens(loc)
 
 
 class MLATokenToKVPool(KVCache):

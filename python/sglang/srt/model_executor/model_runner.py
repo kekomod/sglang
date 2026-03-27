@@ -2545,10 +2545,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if can_run_graph:
-            return (
-                self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs),
-                can_run_graph,
-            )
+            # TurboQuant: toggle graph mode for get_buffer read routing
+            pool = forward_batch.token_to_kv_pool
+            is_tq = hasattr(pool, '_graph_mode')
+            if is_tq:
+                pool.set_graph_mode(True)
+
+            ret = self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+
+            if is_tq:
+                pool.set_graph_mode(False)
+
+            return (ret, can_run_graph)
 
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
@@ -2682,7 +2690,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if can_run_graph:
-            # TurboQuant: enable graph mode so set_kv_buffer only writes BF16
+            # TurboQuant: toggle graph mode for get_buffer read routing
             pool = forward_batch.token_to_kv_pool
             is_tq = hasattr(pool, '_graph_mode')
             if is_tq:
@@ -2694,10 +2702,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
 
-            # TurboQuant: quantize new tokens from BF16 workspace after replay
             if is_tq:
                 pool.set_graph_mode(False)
-                pool.quant_new_tokens(forward_batch.out_cache_loc)
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 

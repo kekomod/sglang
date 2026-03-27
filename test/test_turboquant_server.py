@@ -5,7 +5,9 @@ Runs against a live SGLang server at http://localhost:30000.
 Usage: python test/test_turboquant_server.py
 """
 
+import concurrent.futures
 import sys
+
 import requests
 
 BASE_URL = "http://localhost:30000"
@@ -176,6 +178,34 @@ def test_image_prompt():
     return output.strip()[:80]
 
 
+def test_concurrent_batch_decode():
+    """Concurrent requests trigger batched CUDA graph replay."""
+    prompt = "Count from 1 to 5:"
+    num_requests = 20
+
+    def send_request(_):
+        return generate(prompt, max_new_tokens=30, temperature=0.1)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_requests) as executor:
+        results = list(executor.map(send_request, range(num_requests)))
+
+    # All should return non-empty output
+    assert all(len(r.strip()) > 0 for r in results), "Some requests returned empty output"
+    return f"All {num_requests} concurrent requests returned output"
+
+
+def test_long_sustained_generation():
+    """Long generation tests CUDA graph replay stability over many steps."""
+    out = generate(
+        "Write a detailed essay about the history of computing.",
+        max_new_tokens=400,
+        temperature=0.1,
+    )
+    words = len(out.split())
+    assert words > 100, f"Expected 100+ words, got {words}"
+    return f"{len(out)} chars, {words} words"
+
+
 def test_consistency():
     """Same prompt twice with temperature=0 should produce identical output."""
     prompt = "The chemical formula for water is"
@@ -195,6 +225,8 @@ ALL_TESTS = [
     test_long_prompt,
     test_multiple_requests,
     test_image_prompt,
+    test_concurrent_batch_decode,
+    test_long_sustained_generation,
     test_consistency,
 ]
 
@@ -204,9 +236,15 @@ def main():
         print(f"SERVER NOT RUNNING at {BASE_URL} — skipping all tests")
         sys.exit(1)
 
-    # Warmup: triggers CUDA graph capture and Triton kernel JIT so that
-    # subsequent tests run on stable, compiled code paths.
+    # Warmup: single request + concurrent burst to stabilize all internal
+    # caches (FlashInfer kernels, CUDA allocator, batch-size graph buckets).
+    # Must match or exceed test_concurrent_batch_decode's intensity (20 requests).
     generate("Warmup", max_new_tokens=5, temperature=0.0)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        list(executor.map(
+            lambda _: generate("Warmup", max_new_tokens=5, temperature=0.0),
+            range(20),
+        ))
 
     passed = 0
     failed = 0

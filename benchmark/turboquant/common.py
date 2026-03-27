@@ -55,7 +55,6 @@ SERVER_CONFIGS = {
             "--kv-cache-quantization", "turboquant",
             "--turboquant-bits", "3.5",
             "--attention-backend", "turboquant",
-            "--disable-cuda-graph",
         ],
     },
 }
@@ -96,6 +95,7 @@ def launch_server(
     port: int = DEFAULT_PORT,
     timeout: float = DEFAULT_TIMEOUT,
     context_length: int = 4096,
+    model_path: str | None = None,
 ) -> subprocess.Popen:
     """Launch an SGLang server with the given config.
 
@@ -108,7 +108,7 @@ def launch_server(
     cfg = SERVER_CONFIGS[config_name]
     cmd = [
         sys.executable, "-m", "sglang.launch_server",
-        "--model-path", MODEL_PATH,
+        "--model-path", model_path or MODEL_PATH,
         "--port", str(port),
         "--context-length", str(context_length),
         *cfg["args"],

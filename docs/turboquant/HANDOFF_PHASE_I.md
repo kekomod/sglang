@@ -108,6 +108,20 @@ done
 wait
 ```
 
+### I6. Consistency Non-Determinism in No-CUDA-Graph Mode
+
+**Scenario:** With `--disable-cuda-graph` (FlashInfer backend), sending the same prompt twice at temperature=0 can produce different outputs. Discovered when `test_concurrent_batch_decode` (20 simultaneous requests) runs before the consistency test — the concurrent load perturbs internal state enough to flip borderline tokens.
+
+**Current behavior:** Not a bug introduced by TurboQuant code — it's inherent to lossy KV quantization + prefix caching. Request 2 reuses request 1's quantized (lossy) KV via prefix cache. The quantization error at decision-boundary tokens can tip the output differently than fresh computation. This affects any lossy KV cache quantization scheme. Both CUDA graph modes (fused + FlashInfer) pass consistency 8/8.
+
+**Decision to consider:** Is this worth fixing for the no-graph fallback path? Options:
+- Accept and document as known limitation (no-graph is fallback, CUDA graph modes are default)
+- Disable prefix caching when TurboQuant + no-graph is used (bad for performance)
+- Add a tolerance to the consistency test (e.g., check first N tokens match instead of exact)
+- Investigate whether the dequant path introduces non-determinism beyond quantization error
+
+**Files:** `test/test_turboquant_server.py`, possibly `turboquant_pool.py` dequant path
+
 ## Priority Assessment
 
 | Item | Risk if ignored | Complexity | Recommendation |
@@ -117,3 +131,4 @@ wait
 | I3. Graph mode context manager | Low (current code is correct, just not crash-safe) | Low | Worth doing — small change, defensive |
 | I4. Prefix cache consistency | Very low (slot allocator invariant protects this) | Medium (debug assertions + tracing) | Verify once manually; skip assertions unless issues arise |
 | I5. Memory reporting | None (functional correctness unaffected) | Low | Nice-to-have for diagnostics |
+| I6. No-graph consistency | Low (fallback path only, CUDA graph modes pass 8/8) | Medium | Accept and document; default mode is unaffected |

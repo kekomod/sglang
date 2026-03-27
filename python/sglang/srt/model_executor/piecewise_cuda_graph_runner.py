@@ -583,12 +583,22 @@ class PiecewiseCudaGraphRunner:
                 )
             return
 
+        # TurboQuant: enable graph mode during capture so set_kv_buffer
+        # only does BF16 scatter (graph-safe), skipping quantization
+        kv_pool = self.model_runner.token_to_kv_pool
+        is_tq = hasattr(kv_pool, '_graph_mode')
+        if is_tq:
+            kv_pool.set_graph_mode(True)
+
         # run twice for warmup at the first time and cuda graph capture at the second time
         # detail lies in sglang/python/sglang/srt/compilation/cuda_piecewise_backend.py
         for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
+
+        if is_tq:
+            kv_pool.set_graph_mode(False)
 
         return
 

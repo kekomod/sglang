@@ -2250,12 +2250,8 @@ class ServerArgs:
             logger.info(
                 f"TurboQuant KV cache quantization enabled (attention backend: {backend_name})"
             )
-            if self.attention_backend == "turboquant" and not self.disable_cuda_graph:
-                logger.warning(
-                    "CUDA graphs disabled for TurboQuant fused attention backend "
-                    "(fused kernels are not graph-safe). Use default backend for CUDA graph support."
-                )
-                self.disable_cuda_graph = True
+            if self.attention_backend == "turboquant":
+                logger.info("TurboQuant fused attention backend with CUDA graphs enabled")
 
         # Pick the default attention backend if not specified
         if self.attention_backend is None:
