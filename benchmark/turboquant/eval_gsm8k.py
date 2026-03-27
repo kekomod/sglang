@@ -6,11 +6,15 @@ Target: <2% accuracy drop vs BF16 baseline (arXiv:2504.19874).
 
 Usage (standalone, server already running):
     python eval_gsm8k.py --port 30000 [--num-examples 50]
+
+Usage (multi-config, manages server lifecycle):
+    python eval_gsm8k.py --configs bf16 turboquant_3.5bit --model /path/to/model
 """
 
 import argparse
 import ast
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -18,8 +22,13 @@ from tqdm import tqdm
 
 from common import (
     DEFAULT_PORT,
+    SERVER_CONFIGS,
+    check_target,
     generate_text,
+    launch_server,
+    print_comparison_table,
     save_results,
+    shutdown_server,
 )
 
 from sglang.utils import download_and_cache_file, read_jsonl
@@ -123,14 +132,89 @@ def run_gsm8k_benchmark(
     return metrics
 
 
+def run_multi_config(args) -> int:
+    """Run GSM8K eval across multiple configs, managing server lifecycle."""
+    all_results: dict[str, dict] = {}
+
+    for config_name in args.configs:
+        print(f"\n{'#' * 60}")
+        print(f"  GSM8K — {SERVER_CONFIGS[config_name]['name']}")
+        print(f"{'#' * 60}")
+
+        proc = None
+        try:
+            proc = launch_server(
+                config_name,
+                port=args.port,
+                context_length=args.context_length,
+                model_path=args.model,
+            )
+            base_url = f"http://127.0.0.1:{args.port}"
+
+            t0 = time.time()
+            metrics = run_gsm8k_benchmark(
+                base_url, num_examples=args.num_examples,
+            )
+            metrics["elapsed_seconds"] = round(time.time() - t0, 1)
+            save_results("gsm8k", config_name, metrics, args.output_dir)
+            all_results[config_name] = metrics
+
+        except Exception as exc:
+            print(f"  ERROR running {config_name}: {exc}")
+        finally:
+            if proc is not None:
+                shutdown_server(proc)
+            time.sleep(5)
+
+    # Print comparison table
+    if all_results:
+        display = {}
+        for cfg, m in all_results.items():
+            display[cfg] = {
+                "accuracy": m["accuracy"],
+                "correct": f"{m['correct']}/{m['total']}",
+                "invalid": m["invalid"],
+            }
+        print_comparison_table("gsm8k", display)
+
+        # PASS/FAIL check
+        if "bf16" in all_results:
+            baseline = all_results["bf16"]
+            for cfg in all_results:
+                if cfg == "bf16":
+                    continue
+                passed, msg = check_target("gsm8k", baseline, all_results[cfg])
+                status = "PASS" if passed else "FAIL"
+                name = SERVER_CONFIGS.get(cfg, {}).get("name", cfg)
+                print(f"  [{status}] {name}: {msg}")
+            print()
+
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="GSM8K 10-shot benchmark")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--num-examples", type=int, default=NUM_EXAMPLES)
     parser.add_argument("--config-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default="results")
+    parser.add_argument("--model", type=str,
+                        default="/home/keko/AI/image-prep/models/qwen2.5-3b-instruct",
+                        help="Model path for server")
+    parser.add_argument("--configs", nargs="+", default=None,
+                        help="Multi-config mode: launch server per config (e.g. bf16 turboquant_3.5bit)")
+    parser.add_argument("--context-length", type=int, default=4096)
     args = parser.parse_args()
 
+    # Multi-config mode: manage server lifecycle internally
+    if args.configs:
+        for c in args.configs:
+            if c not in SERVER_CONFIGS:
+                print(f"Unknown config: {c}. Choose from: {list(SERVER_CONFIGS)}")
+                return 1
+        return run_multi_config(args)
+
+    # Single-config mode: server already running
     base_url = f"http://127.0.0.1:{args.port}"
     metrics = run_gsm8k_benchmark(base_url, num_examples=args.num_examples)
 

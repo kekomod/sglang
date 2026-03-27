@@ -32,7 +32,7 @@ from eval_perplexity import compute_perplexity
 
 BENCHMARK_RUNNERS = {
     "perplexity": lambda base_url, **kw: compute_perplexity(base_url, max_chunks=kw.get("max_chunks")),
-    "needle": lambda base_url, **kw: run_needle_benchmark(base_url),
+    "needle": lambda base_url, **kw: run_needle_benchmark(base_url, context_lengths=[1024, 2048, 3072, 4096]),
     "gsm8k": lambda base_url, **kw: run_gsm8k_benchmark(base_url),
 }
 
