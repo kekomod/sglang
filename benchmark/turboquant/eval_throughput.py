@@ -47,7 +47,11 @@ from common import (
 # ---------------------------------------------------------------------------
 
 IMAGE_DIR = Path("/home/keko/AI/image-prep/data/images/processed")
-IMAGE_PROMPT = "Describe this image in one detailed sentence."
+_VLM_PROMPT_PATH = Path("/home/keko/AI/image-prep/stages/vlm_prompt.md")
+if _VLM_PROMPT_PATH.exists():
+    IMAGE_PROMPT = _VLM_PROMPT_PATH.read_text()
+else:
+    IMAGE_PROMPT = "Describe this image in one detailed sentence."
 TEXT_PROMPTS = [
     "Explain the theory of general relativity in simple terms.",
     "Write a short story about a robot learning to cook.",
@@ -433,7 +437,7 @@ def main():
         proc = None
         try:
             proc = launch_server(config_name, port=args.port, timeout=300,
-                                 context_length=4096, model_path=args.model)
+                                 context_length=8192, model_path=args.model)
             base_url = f"http://127.0.0.1:{args.port}"
             mem_launch = get_gpu_memory_mb()
             metrics = run_benchmark(base_url, images=images, text_prompts=text_prompts,

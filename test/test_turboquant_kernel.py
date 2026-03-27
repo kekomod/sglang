@@ -951,6 +951,275 @@ def test_triton_fwht_roundtrip():
 
 
 # ---------------------------------------------------------------------------
+# Test: fused decode kernel vs non-fused (Phase G)
+# ---------------------------------------------------------------------------
+
+def test_fused_decode_vs_nonfused():
+    """Verify fused FWHT decode kernel matches non-fused pipeline output."""
+    from sglang.srt.layers.attention.triton_ops.turboquant_decode_attention import (
+        turboquant_decode_attention_fused_fwd,
+        turboquant_decode_attention_fwd,
+    )
+
+    device = "cuda"
+    torch.manual_seed(42)
+
+    B, H_q, H_kv, D = 1, 8, 4, 128
+    seq_len = 64
+    bits = 3
+    mse_bits = max(bits - 1, 0)
+    seed = 42
+
+    hadamard = HadamardTransform(D, seed, device)
+    s = projection_matrix(D, seed).to(device)
+    k_cb = compute_codebook(D, mse_bits).to(device)
+    v_cb = compute_codebook(D, bits).to(device)
+
+    q = torch.randn(B, H_q, D, device=device, dtype=torch.float32)
+    k_raw = torch.randn(seq_len, H_kv, D, device=device, dtype=torch.float32)
+    v_raw = torch.randn(seq_len, H_kv, D, device=device, dtype=torch.float32)
+
+    k_mse_p, k_qjl_p, k_norms, k_res_norms = prod_quantize(k_raw, hadamard, s, k_cb, bits)
+    v_packed, v_norms = mse_quantize(v_raw, hadamard, v_cb, bits)
+
+    kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+    kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
+    max_kv_splits = 8
+    num_kv_splits = torch.tensor([max_kv_splits], dtype=torch.int32, device=device)
+
+    BLOCK_DV = triton.next_power_of_2(hadamard.padded_dim)
+    sm_scale = 1.0 / math.sqrt(D)
+    qjl_scale = math.sqrt(math.pi / 2.0) / D
+
+    # === Non-fused path ===
+    q_rot = hadamard.forward(q)
+    q_proj = torch.matmul(q, s.T)
+    o_rot = torch.empty(B, H_q, hadamard.padded_dim, dtype=torch.float32, device=device)
+    attn_logits = torch.empty(B, H_q, max_kv_splits, BLOCK_DV, dtype=torch.float32, device=device)
+    attn_lse = attn_logits[:, :, :, 0].contiguous()
+
+    turboquant_decode_attention_fwd(
+        q_rot, q_proj,
+        k_mse_p, k_qjl_p, k_norms, k_res_norms,
+        v_packed, v_norms, k_cb, v_cb, o_rot,
+        kv_indptr, kv_indices, num_kv_splits,
+        max_kv_splits, sm_scale, qjl_scale,
+        mse_bits, bits, hadamard.padded_dim,
+        attn_logits, attn_lse,
+    )
+    nonfused_out = hadamard.inverse(o_rot)
+
+    # === Fused path (Stage 1 uses pre-rotated q, Stage 2 does inline inv FWHT) ===
+    q_rot2 = hadamard.forward(q)
+    q_proj2 = torch.matmul(q, s.T)
+    o_fused = torch.empty(B, H_q, hadamard.padded_dim, dtype=torch.float32, device=device)
+    attn_logits2 = torch.empty(B, H_q, max_kv_splits, BLOCK_DV, dtype=torch.float32, device=device)
+    attn_lse2 = attn_logits2[:, :, :, 0].contiguous()
+
+    turboquant_decode_attention_fused_fwd(
+        q_rot2, q_proj2,
+        hadamard.signs, hadamard.scale,
+        k_mse_p, k_qjl_p, k_norms, k_res_norms,
+        v_packed, v_norms, k_cb, v_cb, o_fused,
+        kv_indptr, kv_indices, num_kv_splits,
+        max_kv_splits, sm_scale, qjl_scale,
+        mse_bits, bits, hadamard.padded_dim,
+        attn_logits2, attn_lse2,
+    )
+    # Fused output is already de-rotated, truncate padding
+    fused_out = o_fused[..., :D]
+
+    max_diff = (nonfused_out - fused_out).abs().max().item()
+    sim = cosine_sim(nonfused_out, fused_out)
+    assert max_diff < 1e-3, f"Fused vs non-fused max diff {max_diff:.2e} >= 1e-3"
+    assert sim > 0.999, f"Fused vs non-fused cosine sim {sim:.6f} < 0.999"
+    return f"max_diff={max_diff:.2e}, cosine_sim={sim:.6f}"
+
+
+# ---------------------------------------------------------------------------
+# Test: fused split-channel decode vs non-fused (Phase G)
+# ---------------------------------------------------------------------------
+
+def test_fused_split_decode_vs_nonfused():
+    """Verify fused split-channel decode kernel matches non-fused pipeline."""
+    from sglang.srt.layers.attention.triton_ops.turboquant_decode_attention import (
+        turboquant_decode_attention_fused_fwd_split,
+        turboquant_decode_attention_fwd_split,
+    )
+
+    device = "cuda"
+    torch.manual_seed(42)
+
+    B, H_q, H_kv, D = 1, 8, 4, 128
+    seq_len = 64
+    total_bits = 3.5
+    seed = 42
+
+    lo_indices, hi_indices = select_outlier_indices(D, total_bits)
+    d_lo = lo_indices.shape[0]
+    d_hi = hi_indices.shape[0]
+    mse_bits_lo = 2
+    mse_bits_hi = 3
+    v_bits_lo = 3
+    v_bits_hi = 4
+
+    hadamard_lo = HadamardTransform(d_lo, seed, device)
+    hadamard_hi = HadamardTransform(d_hi, seed + 1, device)
+    s_lo = projection_matrix(d_lo, seed).to(device)
+    s_hi = projection_matrix(d_hi, seed + 1).to(device)
+    k_cb_lo = compute_codebook(d_lo, mse_bits_lo).to(device)
+    k_cb_hi = compute_codebook(d_hi, mse_bits_hi).to(device)
+    v_cb_lo = compute_codebook(d_lo, v_bits_lo).to(device)
+    v_cb_hi = compute_codebook(d_hi, v_bits_hi).to(device)
+
+    q = torch.randn(B, H_q, D, device=device, dtype=torch.float32)
+    k_raw = torch.randn(seq_len, H_kv, D, device=device, dtype=torch.float32)
+    v_raw = torch.randn(seq_len, H_kv, D, device=device, dtype=torch.float32)
+
+    lo_idx = lo_indices.to(device)
+    hi_idx = hi_indices.to(device)
+    q_lo = q.index_select(-1, lo_idx)
+    q_hi = q.index_select(-1, hi_idx)
+    k_lo = k_raw.index_select(-1, lo_idx)
+    k_hi = k_raw.index_select(-1, hi_idx)
+    v_lo = v_raw.index_select(-1, lo_idx)
+    v_hi = v_raw.index_select(-1, hi_idx)
+
+    k_mse_lo, k_qjl_lo, k_n_lo, k_rn_lo = prod_quantize(k_lo, hadamard_lo, s_lo, k_cb_lo, mse_bits_lo + 1)
+    k_mse_hi, k_qjl_hi, k_n_hi, k_rn_hi = prod_quantize(k_hi, hadamard_hi, s_hi, k_cb_hi, mse_bits_hi + 1)
+    v_p_lo, v_n_lo = mse_quantize(v_lo, hadamard_lo, v_cb_lo, v_bits_lo)
+    v_p_hi, v_n_hi = mse_quantize(v_hi, hadamard_hi, v_cb_hi, v_bits_hi)
+
+    kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+    kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
+    max_kv_splits = 8
+    num_kv_splits = torch.tensor([max_kv_splits], dtype=torch.int32, device=device)
+
+    padded_d_lo = hadamard_lo.padded_dim
+    padded_d_hi = hadamard_hi.padded_dim
+    head_dim = padded_d_lo + padded_d_hi
+    BLOCK_DV = triton.next_power_of_2(head_dim)
+    sm_scale = 1.0 / math.sqrt(D)
+    qjl_scale_lo = math.sqrt(math.pi / 2.0) / d_lo
+    qjl_scale_hi = math.sqrt(math.pi / 2.0) / d_hi
+
+    # === Non-fused path ===
+    q_rot_lo = hadamard_lo.forward(q_lo)
+    q_proj_lo = torch.matmul(q_lo, s_lo.T)
+    q_rot_hi = hadamard_hi.forward(q_hi)
+    q_proj_hi = torch.matmul(q_hi, s_hi.T)
+
+    o_rot_split = torch.empty(B, H_q, head_dim, dtype=torch.float32, device=device)
+    attn_logits = torch.empty(B, H_q, max_kv_splits, head_dim, dtype=torch.float32, device=device)
+    attn_lse = attn_logits[:, :, :, 0].contiguous()
+
+    turboquant_decode_attention_fwd_split(
+        q_rot_lo, q_proj_lo, q_rot_hi, q_proj_hi,
+        k_mse_lo, k_qjl_lo, k_n_lo, k_rn_lo,
+        k_mse_hi, k_qjl_hi, k_n_hi, k_rn_hi,
+        v_p_lo, v_n_lo, v_p_hi, v_n_hi,
+        k_cb_lo, k_cb_hi, v_cb_lo, v_cb_hi,
+        o_rot_split,
+        kv_indptr, kv_indices, num_kv_splits, max_kv_splits,
+        sm_scale, qjl_scale_lo, qjl_scale_hi,
+        mse_bits_lo, mse_bits_hi, v_bits_lo, v_bits_hi,
+        padded_d_lo, padded_d_hi, head_dim,
+        attn_logits, attn_lse,
+    )
+    o_lo_nf = hadamard_lo.inverse(o_rot_split[..., :padded_d_lo])
+    o_hi_nf = hadamard_hi.inverse(o_rot_split[..., padded_d_lo:])
+    nonfused_out = torch.cat([o_lo_nf, o_hi_nf], dim=-1)
+
+    # === Fused path (Stage 1 uses pre-rotated q, Stage 2 does inline inv FWHT) ===
+    q_rot_lo2 = hadamard_lo.forward(q_lo)
+    q_proj_lo2 = torch.matmul(q_lo, s_lo.T)
+    q_rot_hi2 = hadamard_hi.forward(q_hi)
+    q_proj_hi2 = torch.matmul(q_hi, s_hi.T)
+
+    o_fused_split = torch.empty(B, H_q, head_dim, dtype=torch.float32, device=device)
+    attn_logits2 = torch.empty(B, H_q, max_kv_splits, head_dim, dtype=torch.float32, device=device)
+    attn_lse2 = attn_logits2[:, :, :, 0].contiguous()
+
+    turboquant_decode_attention_fused_fwd_split(
+        q_rot_lo2, q_proj_lo2, q_rot_hi2, q_proj_hi2,
+        hadamard_lo.signs, hadamard_hi.signs,
+        hadamard_lo.scale, hadamard_hi.scale,
+        k_mse_lo, k_qjl_lo, k_n_lo, k_rn_lo,
+        k_mse_hi, k_qjl_hi, k_n_hi, k_rn_hi,
+        v_p_lo, v_n_lo, v_p_hi, v_n_hi,
+        k_cb_lo, k_cb_hi, v_cb_lo, v_cb_hi,
+        o_fused_split,
+        kv_indptr, kv_indices, num_kv_splits, max_kv_splits,
+        sm_scale, qjl_scale_lo, qjl_scale_hi,
+        mse_bits_lo, mse_bits_hi, v_bits_lo, v_bits_hi,
+        padded_d_lo, padded_d_hi, head_dim,
+        attn_logits2, attn_lse2,
+    )
+    # Fused output is already de-rotated
+    o_lo_f = o_fused_split[..., :hadamard_lo.dim]
+    o_hi_f = o_fused_split[..., padded_d_lo:padded_d_lo + hadamard_hi.dim]
+    fused_out = torch.cat([o_lo_f, o_hi_f], dim=-1)
+
+    max_diff = (nonfused_out - fused_out).abs().max().item()
+    sim = cosine_sim(nonfused_out, fused_out)
+    assert max_diff < 1e-3, f"Fused split vs non-fused max diff {max_diff:.2e} >= 1e-3"
+    assert sim > 0.999, f"Fused split vs non-fused cosine sim {sim:.6f} < 0.999"
+    return f"max_diff={max_diff:.2e}, cosine_sim={sim:.6f}"
+
+
+# ---------------------------------------------------------------------------
+# Test: rotated-space accumulation equivalence (Phase H verification)
+# ---------------------------------------------------------------------------
+
+def test_rotated_space_equivalence():
+    """Verify rotated-space V accumulation equals standard per-token dequant.
+
+    Phase H optimization: sum(a_t * H_inv(cb_t)) = H_inv(sum(a_t * cb_t))
+    because H_inv is linear.
+    """
+    device = "cuda"
+    torch.manual_seed(42)
+
+    D = 128
+    T = 32  # sequence length
+    bits = 3
+    seed = 42
+
+    hadamard = HadamardTransform(D, seed, device)
+    v_cb = compute_codebook(D, bits).to(device)
+
+    # Generate random value vectors, quantize
+    v_raw = torch.randn(T, D, device=device, dtype=torch.float32)
+    v_packed, v_norms = mse_quantize(v_raw.unsqueeze(1), hadamard, v_cb, bits)
+
+    # Random attention weights (softmax-like)
+    alpha = torch.softmax(torch.randn(T, device=device), dim=0)
+
+    # Method 1 (standard): dequant each V, then weighted sum
+    v_deq = mse_dequantize(v_packed, v_norms, hadamard, v_cb, bits, D)
+    v_deq = v_deq.squeeze(1)  # [T, D]
+    out_standard = (alpha.unsqueeze(-1) * v_deq).sum(dim=0)  # [D]
+
+    # Method 2 (rotated): accumulate codebook values, then one inverse Hadamard
+    # Unpack indices manually
+    v_indices = unpack_bits(v_packed.squeeze(1), bits, hadamard.padded_dim)  # [T, padded_dim]
+    v_norms_flat = v_norms.squeeze(1).squeeze(-1).float()  # [T]
+
+    rot_sum = torch.zeros(hadamard.padded_dim, device=device, dtype=torch.float32)
+    for t in range(T):
+        cb_vals = v_cb[v_indices[t].long()]  # [padded_dim]
+        rot_sum += alpha[t] * v_norms_flat[t] * cb_vals
+    out_rotated = hadamard.inverse(rot_sum.unsqueeze(0)).squeeze(0)  # [D]
+    out_rotated = out_rotated[:D]
+
+    max_diff = (out_standard - out_rotated).abs().max().item()
+    sim = cosine_sim(out_standard, out_rotated)
+    assert max_diff < 1e-3, f"Rotated vs standard max diff {max_diff:.2e} >= 1e-3"
+    assert sim > 0.999, f"Rotated vs standard cosine sim {sim:.6f} < 0.999"
+    return f"max_diff={max_diff:.2e}, cosine_sim={sim:.6f}"
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -967,6 +1236,9 @@ ALL_TESTS = [
     test_extend_variable_batch,
     test_split_extend_vs_reference,
     test_triton_fwht_roundtrip,
+    test_fused_decode_vs_nonfused,
+    test_fused_split_decode_vs_nonfused,
+    test_rotated_space_equivalence,
 ]
 
 

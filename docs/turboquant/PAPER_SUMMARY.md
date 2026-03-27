@@ -294,9 +294,11 @@ Also tested on Ministral-7B-Instruct:
 
 TurboQuant is 170,000x to 1,900,000x faster than alternatives for nearest-neighbor search indexing.
 
-### 6.5 GPU Speedup
+### Addendum: Google Research Blog — Attention Logit Speedup
 
-From the Google Research blog (H100 GPU): up to **8x speedup** for attention logit computation in 4-bit mode vs FP32 unquantized keys.
+*Note: This section references the [Google Research blog post](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/), not the arXiv paper itself.*
+
+From the blog (H100 GPU): up to **8x speedup** for attention logit computation in 4-bit mode vs FP32 unquantized keys. This is specifically about computing Q·K scores directly from quantized data (codebook gather + partial dot) vs FP32 dot products — NOT end-to-end inference speedup.
 
 ---
 

@@ -38,10 +38,14 @@ class TurboQuantAttnBackend(TritonAttnBackend):
         from sglang.srt.layers.attention.triton_ops.turboquant_decode_attention import (
             turboquant_decode_attention_fwd,
             turboquant_decode_attention_fwd_split,
+            turboquant_decode_attention_fused_fwd,
+            turboquant_decode_attention_fused_fwd_split,
         )
         from sglang.srt.layers.attention.triton_ops.turboquant_extend_attention import (
             turboquant_extend_attention_fwd,
             turboquant_extend_attention_fwd_split,
+            turboquant_extend_attention_fused_fwd,
+            turboquant_extend_attention_fused_fwd_split,
         )
 
         self.turboquant_decode_attention_fwd = torch.compiler.disable(
@@ -50,11 +54,23 @@ class TurboQuantAttnBackend(TritonAttnBackend):
         self.turboquant_decode_attention_fwd_split = torch.compiler.disable(
             turboquant_decode_attention_fwd_split
         )
+        self.turboquant_decode_attention_fused_fwd = torch.compiler.disable(
+            turboquant_decode_attention_fused_fwd
+        )
+        self.turboquant_decode_attention_fused_fwd_split = torch.compiler.disable(
+            turboquant_decode_attention_fused_fwd_split
+        )
         self.turboquant_extend_attention_fwd = torch.compiler.disable(
             turboquant_extend_attention_fwd
         )
         self.turboquant_extend_attention_fwd_split = torch.compiler.disable(
             turboquant_extend_attention_fwd_split
+        )
+        self.turboquant_extend_attention_fused_fwd = torch.compiler.disable(
+            turboquant_extend_attention_fused_fwd
+        )
+        self.turboquant_extend_attention_fused_fwd_split = torch.compiler.disable(
+            turboquant_extend_attention_fused_fwd_split
         )
 
     def _get_tq_pool(self, forward_batch: ForwardBatch):
@@ -116,101 +132,90 @@ class TurboQuantAttnBackend(TritonAttnBackend):
 
         if not tq_pool.is_split:
             # ============================================================
-            # Integer-bit path (e.g. 3-bit)
+            # Integer-bit path — fused extend with inverse FWHT
             # ============================================================
             head_dim = tq_pool.head_dim
 
-            # Get quantized buffers
             q_bufs = tq_pool.get_quantized_k_buffers(mapped_id)
             v_bufs = tq_pool.get_quantized_v_buffers(mapped_id)
 
-            # Pre-rotate and project queries
-            # q: [T, H_q * D] -> [T, H_q, D] -> float32
             q_float = q.view(total_q, layer.tp_q_head_num, layer.qk_head_dim).float()
             q_rot = tq_pool.k_hadamard[li].forward(q_float)
             q_proj = torch.matmul(q_float, tq_pool.s_matrices[li].T)
 
-            # Output buffer in rotated space (padded_dim from Hadamard)
             padded_dim = tq_pool.k_hadamard[li].padded_dim
-            o_rot = torch.empty(
+            output = torch.empty(
                 (total_q, layer.tp_q_head_num, padded_dim),
                 dtype=torch.float32,
                 device=q.device,
             )
 
-            # QJL scale: sqrt(pi/2) / D (paper Eq. 7)
             qjl_scale = math.sqrt(math.pi / 2.0) / head_dim
 
-            # Call TurboQuant fused extend kernel
-            self.turboquant_extend_attention_fwd(
-                q_rot,
-                q_proj,
-                q_bufs["mse_packed"],
-                q_bufs["qjl_packed"],
-                q_bufs["norms"],
-                q_bufs["res_norms"],
-                v_bufs["packed"],
-                v_bufs["norms"],
-                tq_pool.k_codebook,
-                tq_pool.v_codebook,
-                o_rot,
-                qo_indptr,
-                kv_indptr,
-                kv_indices,
-                prefix_lens,
-                max_extend_len,
-                layer.scaling,
-                qjl_scale,
-                tq_pool.k_mse_bits,
-                tq_pool.int_bits,  # v_bits = full integer bits
+            # Fused extend: kernel + inverse FWHT handled internally
+            self.turboquant_extend_attention_fused_fwd(
+                q_rot, q_proj,
+                tq_pool.k_hadamard[li].signs,
+                tq_pool.k_hadamard[li].scale,
+                tq_pool.k_hadamard[li].dim,
+                q_bufs["mse_packed"], q_bufs["qjl_packed"],
+                q_bufs["norms"], q_bufs["res_norms"],
+                v_bufs["packed"], v_bufs["norms"],
+                tq_pool.k_codebook, tq_pool.v_codebook,
+                output,
+                qo_indptr, kv_indptr, kv_indices, prefix_lens,
+                max_extend_len, layer.scaling, qjl_scale,
+                tq_pool.k_mse_bits, tq_pool.int_bits,
                 padded_dim,
             )
 
-            # Inverse rotate output via Hadamard
-            output = tq_pool.k_hadamard[li].inverse(o_rot)
+            # Output already de-rotated — truncate padding
+            output = output[..., :tq_pool.k_hadamard[li].dim]
             return output.to(q.dtype).view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
         else:
             # ============================================================
-            # Split-channel path (fractional bits, e.g. 3.5-bit)
+            # Split-channel path — fused extend with per-group inverse FWHT
             # ============================================================
             d_lo, d_hi = tq_pool.d_lo, tq_pool.d_hi
-            head_dim = tq_pool.head_dim  # = d_lo + d_hi
+            head_dim = tq_pool.head_dim
 
-            # Get split quantized buffers
             k_bufs = tq_pool.get_quantized_k_buffers(mapped_id)
             v_bufs = tq_pool.get_quantized_v_buffers(mapped_id)
 
-            # Split queries by channel indices, rotate/project per group
             q_float = q.view(total_q, layer.tp_q_head_num, layer.qk_head_dim).float()
             lo_idx = tq_pool.lo_indices.to(q.device)
             hi_idx = tq_pool.hi_indices.to(q.device)
 
-            q_lo = q_float.index_select(-1, lo_idx)   # [T, H_q, d_lo]
-            q_hi = q_float.index_select(-1, hi_idx)   # [T, H_q, d_hi]
+            q_lo = q_float.index_select(-1, lo_idx)
+            q_hi = q_float.index_select(-1, hi_idx)
 
             q_rot_lo = tq_pool.hadamard_lo[li].forward(q_lo)
             q_proj_lo = torch.matmul(q_lo, tq_pool.s_lo[li].T)
             q_rot_hi = tq_pool.hadamard_hi[li].forward(q_hi)
             q_proj_hi = torch.matmul(q_hi, tq_pool.s_hi[li].T)
 
-            # Output buffer in split order [padded_d_lo + padded_d_hi]
             padded_d_lo = tq_pool.hadamard_lo[li].padded_dim
             padded_d_hi = tq_pool.hadamard_hi[li].padded_dim
-            o_rot_split = torch.empty(
+            output_split = torch.empty(
                 (total_q, layer.tp_q_head_num, padded_d_lo + padded_d_hi),
                 dtype=torch.float32,
                 device=q.device,
             )
 
-            # QJL scale per group
             qjl_scale_lo = math.sqrt(math.pi / 2.0) / d_lo
             qjl_scale_hi = math.sqrt(math.pi / 2.0) / d_hi
 
-            # Call split-channel extend kernel
-            self.turboquant_extend_attention_fwd_split(
+            # Fused extend: kernel + per-group inverse FWHT handled internally
+            self.turboquant_extend_attention_fused_fwd_split(
                 q_rot_lo, q_proj_lo,
                 q_rot_hi, q_proj_hi,
+                tq_pool.hadamard_lo[li].signs,
+                tq_pool.hadamard_hi[li].signs,
+                tq_pool.hadamard_lo[li].scale,
+                tq_pool.hadamard_hi[li].scale,
+                tq_pool.hadamard_lo[li].dim,
+                tq_pool.hadamard_hi[li].dim,
                 k_bufs["lo_mse_packed"], k_bufs["lo_qjl_packed"],
                 k_bufs["lo_norms"], k_bufs["lo_res_norms"],
                 k_bufs["hi_mse_packed"], k_bufs["hi_qjl_packed"],
@@ -219,26 +224,21 @@ class TurboQuantAttnBackend(TritonAttnBackend):
                 v_bufs["hi_packed"], v_bufs["hi_norms"],
                 tq_pool.k_cb_lo, tq_pool.k_cb_hi,
                 tq_pool.v_cb_lo, tq_pool.v_cb_hi,
-                o_rot_split,
-                qo_indptr,
-                kv_indptr,
-                kv_indices,
-                prefix_lens,
-                max_extend_len,
-                layer.scaling,
+                output_split,
+                qo_indptr, kv_indptr, kv_indices, prefix_lens,
+                max_extend_len, layer.scaling,
                 qjl_scale_lo, qjl_scale_hi,
                 tq_pool.k_lo_mse_bits, tq_pool.k_hi_mse_bits,
                 tq_pool.v_lo_bits, tq_pool.v_hi_bits,
                 padded_d_lo, padded_d_hi, padded_d_lo + padded_d_hi,
             )
 
-            # Inverse rotate per group via Hadamard
-            o_lo = tq_pool.hadamard_lo[li].inverse(o_rot_split[..., :padded_d_lo])
-            o_hi = tq_pool.hadamard_hi[li].inverse(o_rot_split[..., padded_d_lo:])
+            # Output already de-rotated — truncate and reassemble
+            o_lo = output_split[..., :tq_pool.hadamard_lo[li].dim]
+            o_hi = output_split[..., padded_d_lo:padded_d_lo + tq_pool.hadamard_hi[li].dim]
 
-            # Reassemble in original channel order
-            output_split = torch.cat([o_lo, o_hi], dim=-1)
-            output = output_split.index_select(-1, tq_pool.restore_order.to(q.device))
+            output_cat = torch.cat([o_lo, o_hi], dim=-1)
+            output = output_cat.index_select(-1, tq_pool.restore_order.to(q.device))
             return output.to(q.dtype).view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
@@ -281,7 +281,7 @@ class TurboQuantAttnBackend(TritonAttnBackend):
 
         if not tq_pool.is_split:
             # ============================================================
-            # Integer-bit path (e.g. 3-bit)
+            # Integer-bit path (e.g. 3-bit) — fused Stage 2 inverse FWHT
             # ============================================================
             head_dim = tq_pool.head_dim
 
@@ -289,17 +289,17 @@ class TurboQuantAttnBackend(TritonAttnBackend):
             q_bufs = tq_pool.get_quantized_k_buffers(mapped_id)
             v_bufs = tq_pool.get_quantized_v_buffers(mapped_id)
 
-            # Pre-rotate and project queries
             # q: [B, H_q * D] -> [B, H_q, D] -> float32
             q_float = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).float()
 
-            # Pre-rotate queries via Hadamard, project for QJL
+            # Pre-rotate query via standalone FWHT kernel (tiny, fast)
             q_rot = tq_pool.k_hadamard[li].forward(q_float)
+            # QJL projection (cuBLAS)
             q_proj = torch.matmul(q_float, tq_pool.s_matrices[li].T)
 
-            # Output buffer in rotated space (padded_dim from Hadamard)
+            # Output buffer (de-rotated by fused Stage 2)
             padded_dim = tq_pool.k_hadamard[li].padded_dim
-            o_rot = torch.empty(
+            output = torch.empty(
                 (q_float.shape[0], layer.tp_q_head_num, padded_dim),
                 dtype=torch.float32,
                 device=q.device,
@@ -308,10 +308,12 @@ class TurboQuantAttnBackend(TritonAttnBackend):
             # QJL scale: sqrt(pi/2) / D (paper Eq. 7)
             qjl_scale = math.sqrt(math.pi / 2.0) / head_dim
 
-            # Call TurboQuant fused decode kernel
-            self.turboquant_decode_attention_fwd(
+            # Fused decode: Stage 1 (pre-rotated q) + Stage 2 (inline inverse FWHT)
+            self.turboquant_decode_attention_fused_fwd(
                 q_rot,
                 q_proj,
+                tq_pool.k_hadamard[li].signs,
+                tq_pool.k_hadamard[li].scale,
                 q_bufs["mse_packed"],
                 q_bufs["qjl_packed"],
                 q_bufs["norms"],
@@ -320,7 +322,7 @@ class TurboQuantAttnBackend(TritonAttnBackend):
                 v_bufs["norms"],
                 tq_pool.k_codebook,
                 tq_pool.v_codebook,
-                o_rot,
+                output,
                 kv_indptr,
                 kv_indices,
                 self.forward_metadata.num_kv_splits,
@@ -334,13 +336,13 @@ class TurboQuantAttnBackend(TritonAttnBackend):
                 self.forward_metadata.attn_lse,
             )
 
-            # Inverse rotate output via Hadamard
-            output = tq_pool.k_hadamard[li].inverse(o_rot)
+            # Output already de-rotated by fused Stage 2 — truncate padding
+            output = output[..., :tq_pool.k_hadamard[li].dim]
             return output.to(q.dtype).view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
         else:
             # ============================================================
-            # Split-channel path (fractional bits, e.g. 3.5-bit)
+            # Split-channel path (fractional bits, e.g. 3.5-bit) — fused FWHT (Phase G)
             # ============================================================
             d_lo, d_hi = tq_pool.d_lo, tq_pool.d_hi
             head_dim = tq_pool.head_dim  # = d_lo + d_hi
@@ -349,7 +351,7 @@ class TurboQuantAttnBackend(TritonAttnBackend):
             k_bufs = tq_pool.get_quantized_k_buffers(mapped_id)  # 8-item dict
             v_bufs = tq_pool.get_quantized_v_buffers(mapped_id)  # 4-item dict
 
-            # Split queries by channel indices, rotate/project per group
+            # Split queries by channel indices, rotate, project
             q_float = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).float()
             lo_idx = tq_pool.lo_indices.to(q.device)
             hi_idx = tq_pool.hi_indices.to(q.device)
@@ -357,28 +359,34 @@ class TurboQuantAttnBackend(TritonAttnBackend):
             q_lo = q_float.index_select(-1, lo_idx)  # [B, H_q, d_lo]
             q_hi = q_float.index_select(-1, hi_idx)  # [B, H_q, d_hi]
 
+            # Pre-rotate queries via standalone FWHT kernel (tiny, fast)
             q_rot_lo = tq_pool.hadamard_lo[li].forward(q_lo)
-            q_proj_lo = torch.matmul(q_lo, tq_pool.s_lo[li].T)
             q_rot_hi = tq_pool.hadamard_hi[li].forward(q_hi)
+            # QJL projections (cuBLAS)
+            q_proj_lo = torch.matmul(q_lo, tq_pool.s_lo[li].T)
             q_proj_hi = torch.matmul(q_hi, tq_pool.s_hi[li].T)
 
-            # Output buffer in split order [padded_d_lo + padded_d_hi]
+            # Output buffer (de-rotated by fused Stage 2, split order)
             padded_d_lo = tq_pool.hadamard_lo[li].padded_dim
             padded_d_hi = tq_pool.hadamard_hi[li].padded_dim
-            o_rot_split = torch.empty(
+            output_split = torch.empty(
                 (q_float.shape[0], layer.tp_q_head_num, padded_d_lo + padded_d_hi),
                 dtype=torch.float32,
                 device=q.device,
             )
 
-            # QJL scale: per-group sqrt(pi/2) / D_group (paper + MLX _SplitCodec)
+            # QJL scale: per-group sqrt(pi/2) / D_group
             qjl_scale_lo = math.sqrt(math.pi / 2.0) / d_lo
             qjl_scale_hi = math.sqrt(math.pi / 2.0) / d_hi
 
-            # Call split-channel kernel
-            self.turboquant_decode_attention_fwd_split(
+            # Fused decode: Stage 1 (pre-rotated q) + Stage 2 (inline inverse FWHT)
+            self.turboquant_decode_attention_fused_fwd_split(
                 q_rot_lo, q_proj_lo,
                 q_rot_hi, q_proj_hi,
+                tq_pool.hadamard_lo[li].signs,
+                tq_pool.hadamard_hi[li].signs,
+                tq_pool.hadamard_lo[li].scale,
+                tq_pool.hadamard_hi[li].scale,
                 k_bufs["lo_mse_packed"], k_bufs["lo_qjl_packed"],
                 k_bufs["lo_norms"], k_bufs["lo_res_norms"],
                 k_bufs["hi_mse_packed"], k_bufs["hi_qjl_packed"],
@@ -387,7 +395,7 @@ class TurboQuantAttnBackend(TritonAttnBackend):
                 v_bufs["hi_packed"], v_bufs["hi_norms"],
                 tq_pool.k_cb_lo, tq_pool.k_cb_hi,
                 tq_pool.v_cb_lo, tq_pool.v_cb_hi,
-                o_rot_split,
+                output_split,
                 kv_indptr, kv_indices,
                 self.forward_metadata.num_kv_splits,
                 self.max_kv_splits,
@@ -399,12 +407,12 @@ class TurboQuantAttnBackend(TritonAttnBackend):
                 self.forward_metadata.attn_lse,
             )
 
-            # Inverse rotate per group via Hadamard
-            o_lo = tq_pool.hadamard_lo[li].inverse(o_rot_split[..., :padded_d_lo])
-            o_hi = tq_pool.hadamard_hi[li].inverse(o_rot_split[..., padded_d_lo:])
+            # Output already de-rotated — truncate padding and reassemble
+            o_lo = output_split[..., :tq_pool.hadamard_lo[li].dim]
+            o_hi = output_split[..., padded_d_lo:padded_d_lo + tq_pool.hadamard_hi[li].dim]
 
             # Reassemble in original channel order
-            output_split = torch.cat([o_lo, o_hi], dim=-1)
-            output = output_split.index_select(-1, tq_pool.restore_order.to(q.device))
+            output_cat = torch.cat([o_lo, o_hi], dim=-1)
+            output = output_cat.index_select(-1, tq_pool.restore_order.to(q.device))
 
             return output.to(q.dtype).view(-1, layer.tp_q_head_num * layer.v_head_dim)

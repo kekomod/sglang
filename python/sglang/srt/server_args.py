@@ -2242,16 +2242,22 @@ class ServerArgs:
         ):  # override the default attention backend
             self.attention_backend = self.prefill_attention_backend
 
-        # TurboQuant KV cache quantization: works with any attention backend
-        # via dequant-on-read. For fused kernels, user can opt-in with
-        # --attention-backend turboquant
+        # TurboQuant KV cache quantization: auto-select fused attention backend
+        # for real memory savings. FlashInfer fallback wastes memory (BF16 workspace).
         if getattr(self, "kv_cache_quantization", None) == "turboquant":
-            backend_name = self.attention_backend or "default"
-            logger.info(
-                f"TurboQuant KV cache quantization enabled (attention backend: {backend_name})"
-            )
-            if self.attention_backend == "turboquant":
-                logger.info("TurboQuant fused attention backend with CUDA graphs enabled")
+            if self.attention_backend is None:
+                self.attention_backend = "turboquant"
+                logger.info(
+                    "TurboQuant: auto-selecting fused attention backend "
+                    "(no BF16 workspace, real memory savings)"
+                )
+            elif self.attention_backend == "turboquant":
+                logger.info("TurboQuant fused attention backend enabled")
+            else:
+                logger.warning(
+                    f"TurboQuant with {self.attention_backend} backend uses BF16 workspace "
+                    "(no memory savings). Use --attention-backend turboquant for compression."
+                )
 
         # Pick the default attention backend if not specified
         if self.attention_backend is None:
