@@ -122,6 +122,74 @@ wait
 
 **Files:** `test/test_turboquant_server.py`, possibly `turboquant_pool.py` dequant path
 
+### I7. Long-Context Benchmarks (32K-128K)
+
+**Context:** All current benchmarks test at 4K-8K context where KV cache is tiny relative to model weights. TurboQuant's value proposition (memory savings enabling longer context) has never been demonstrated. The paper's benchmarks are at long context (LongBench-E, needle-in-haystack at 128K+).
+
+**What to do:**
+- Benchmark Qwen2.5-3B (pure transformer, 100% layers have KV cache) at 8K/16K/32K/64K context
+- Measure: peak GPU memory, max achievable context length, throughput at each length
+- Compare BF16 vs TQ: show the context length where BF16 OOMs but TQ fits
+- Use `--context-length 65536` or higher
+
+**Files:** `benchmark/turboquant/eval_throughput.py` (add `--context-length` CLI arg), new benchmark script
+
+### I8. Concurrency Scaling Benchmark
+
+**Context:** TQ's smaller KV cache means more concurrent requests fit in GPU memory. This is the primary real-world benefit but hasn't been measured.
+
+**What to do:**
+- Ramp concurrency (4, 8, 16, 32, 64) until OOM for both BF16 and TQ
+- Report: max concurrency before OOM, throughput at each concurrency level
+- Show the "TQ enables 3-4x more concurrent users" claim with real numbers
+
+**Files:** `benchmark/turboquant/eval_throughput.py`
+
+### I9. Task-Accuracy Metrics
+
+**Context:** Current quality metric (bag-of-words cosine similarity) is meaningless for structured JSON output (shows 0.53-0.55 even when content is correct). The paper uses LongBench-E task accuracy and needle-in-haystack recall.
+
+**What to do:**
+- Add needle-in-haystack evaluation at various context lengths (8K, 16K, 32K)
+- Add simple QA accuracy test (factual questions with verifiable answers)
+- Replace or supplement cosine similarity in eval_throughput.py
+
+**Files:** `benchmark/turboquant/eval_needle.py` (already exists), `benchmark/turboquant/eval_throughput.py`
+
+### I10. Sparse V Dequant Optimization
+
+**Context:** From TheTom/turboquant_plus — at long context, ~90% of softmax attention weights are near-zero. Skipping V codebook lookup + weighted sum for positions where attention weight < threshold saves ~20% decode throughput at 32K+.
+
+**What to do:**
+- In the fused decode kernel's V accumulation loop, skip codebook gather for tokens where softmax weight < 1e-6
+- Only applicable to fused Triton backend (not FlashInfer fallback)
+- Test quality impact (should be zero — skipped weights are negligible)
+
+**Files:** `turboquant_decode_attention.py`
+
+### I11. uint32-Based Bit Packing (MLX Approach)
+
+**Context:** Current `_extract_bits()` uses uint8 with byte-boundary spillover handling (conditional logic per element in Triton inner loop). MLX-VLM uses uint32 bitstream — cleaner extraction, no spillover for 3-bit and 4-bit widths. Reduces conditional branches.
+
+**What to do:**
+- Switch pack/unpack from uint8 to uint32 storage
+- Update `_extract_bits` in both decode and extend Triton kernels
+- Update `pack_bits`/`unpack_bits` in quant_ops.py
+- Benchmark the throughput impact
+
+**Files:** `quant_ops.py`, `turboquant_decode_attention.py`, `turboquant_extend_attention.py`
+
+### I12. Weight Quantization + TQ KV Composition
+
+**Context:** Running larger models (14B-35B) on consumer GPUs requires weight quantization (GPTQ/AWQ 4-bit) alongside TQ KV cache compression. These are independent systems that should compose but haven't been tested together.
+
+**What to do:**
+- Test SGLang with a GPTQ-quantized model + `--kv-cache-quantization turboquant`
+- Verify: model loads, inference works, quality maintained
+- Document any incompatibilities
+
+**Files:** Server launch configuration, possibly `turboquant_pool.py` if dtype handling needs adjustment
+
 ## Priority Assessment
 
 | Item | Risk if ignored | Complexity | Recommendation |
@@ -132,3 +200,9 @@ wait
 | I4. Prefix cache consistency | Very low (slot allocator invariant protects this) | Medium (debug assertions + tracing) | Verify once manually; skip assertions unless issues arise |
 | I5. Memory reporting | None (functional correctness unaffected) | Low | Nice-to-have for diagnostics |
 | I6. No-graph consistency | Low (fallback path only, CUDA graph modes pass 8/8) | Medium | Accept and document; default mode is unaffected |
+| **I7. Long-context benchmarks** | **High (value proposition undemonstrated)** | **Medium** | **Do first — proves TQ works** |
+| **I8. Concurrency scaling** | **High (primary real-world benefit)** | **Low** | **Do alongside I7** |
+| **I9. Task-accuracy metrics** | **Medium (current metric is misleading)** | **Low** | **Replace cosine sim with NIAH** |
+| I10. Sparse V dequant | Low (optimization, not correctness) | Medium | Worth doing after I7 confirms long-context works |
+| I11. uint32 bit packing | Low (optimization) | Medium | Worth doing for kernel throughput |
+| I12. Weight quant + TQ composition | Medium (unlocks larger models on consumer GPUs) | Low-Medium | Test and document |
