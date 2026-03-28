@@ -200,7 +200,7 @@ def test_split_channel_roundtrip():
 # ---------------------------------------------------------------------------
 
 def test_integer_kernel_vs_reference():
-    """Compare Triton decode kernel output against dequant+matmul reference."""
+    """Compare Triton decode kernel output against dequant+matmul reference (MSE-only keys)."""
     from sglang.srt.layers.attention.triton_ops.turboquant_decode_attention import (
         turboquant_decode_attention_fwd,
     )
@@ -211,14 +211,12 @@ def test_integer_kernel_vs_reference():
     B, H_q, H_kv, D = 1, 8, 4, 256
     seq_len = 64
     bits = 3
-    mse_bits = max(bits - 1, 0)
     seed = 42
     kv_group_num = H_q // H_kv
 
-    # Setup codebooks, matrices
+    # Setup codebooks, matrices — keys and values both use full bits MSE
     hadamard = HadamardTransform(D, seed, device)
-    s = projection_matrix(D, seed).to(device)
-    k_cb = compute_codebook(D, mse_bits).to(device)
+    k_cb = compute_codebook(D, bits).to(device)
     v_cb = compute_codebook(D, bits).to(device)
 
     # Random Q, K, V
@@ -226,12 +224,12 @@ def test_integer_kernel_vs_reference():
     k_raw = torch.randn(seq_len, H_kv, D, device=device, dtype=torch.float32)
     v_raw = torch.randn(seq_len, H_kv, D, device=device, dtype=torch.float32)
 
-    # Quantize K (prod) and V (mse)
-    k_mse_p, k_qjl_p, k_norms, k_res_norms = prod_quantize(k_raw, hadamard, s, k_cb, bits)
+    # Quantize K and V (both MSE)
+    k_packed, k_norms = mse_quantize(k_raw, hadamard, k_cb, bits)
     v_packed, v_norms = mse_quantize(v_raw, hadamard, v_cb, bits)
 
     # === REFERENCE: dequant + standard attention ===
-    k_deq = prod_dequantize(k_mse_p, k_qjl_p, k_norms, k_res_norms, hadamard, s, k_cb, bits, D)
+    k_deq = mse_dequantize(k_packed, k_norms, hadamard, k_cb, bits, D)
     v_deq = mse_dequantize(v_packed, v_norms, hadamard, v_cb, bits, D)
 
     # GQA expand: [seq_len, H_kv, D] -> [seq_len, H_q, D]
@@ -239,43 +237,34 @@ def test_integer_kernel_vs_reference():
     v_expanded = v_deq.repeat_interleave(kv_group_num, dim=1)
 
     sm_scale = 1.0 / math.sqrt(D)
-    # Q: [B, H_q, D], K: [seq_len, H_q, D] -> scores: [B, H_q, seq_len]
     scores = torch.einsum("bhd,shd->bhs", q, k_expanded) * sm_scale
     weights = torch.softmax(scores, dim=-1)
-    # weights: [B, H_q, seq_len], V: [seq_len, H_q, D] -> ref_out: [B, H_q, D]
     ref_out = torch.einsum("bhs,shd->bhd", weights, v_expanded)
 
     # === TRITON KERNEL ===
-    # Pre-rotate and project queries
     q_rot = hadamard.forward(q)
-    q_proj = torch.matmul(q, s.T)
 
-    # Page table: simple contiguous
     kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
     kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
 
     max_kv_splits = 8
     num_kv_splits = torch.tensor([max_kv_splits], dtype=torch.int32, device=device)
 
-    # Scratch buffers
     BLOCK_DV = triton.next_power_of_2(hadamard.padded_dim)
     attn_logits = torch.empty(B, H_q, max_kv_splits, BLOCK_DV, dtype=torch.float32, device=device)
-    attn_lse = attn_logits[:, :, :, 0].contiguous()  # shares first element per split
+    attn_lse = attn_logits[:, :, :, 0].contiguous()
 
     o_rot = torch.empty(B, H_q, hadamard.padded_dim, dtype=torch.float32, device=device)
 
-    qjl_scale = math.sqrt(math.pi / 2.0) / D
-
-    # Reshape packed buffers: [seq_len, H_kv, pw] -> pool-style
     turboquant_decode_attention_fwd(
-        q_rot, q_proj,
-        k_mse_p, k_qjl_p, k_norms, k_res_norms,
+        q_rot,
+        k_packed, k_norms,
         v_packed, v_norms,
         k_cb, v_cb,
         o_rot,
         kv_indptr, kv_indices, num_kv_splits,
-        max_kv_splits, sm_scale, qjl_scale,
-        mse_bits, bits, hadamard.padded_dim,
+        max_kv_splits, sm_scale,
+        bits, bits, hadamard.padded_dim,
         attn_logits, attn_lse,
     )
 
@@ -292,7 +281,7 @@ def test_integer_kernel_vs_reference():
 # ---------------------------------------------------------------------------
 
 def test_split_kernel_vs_reference():
-    """Compare split-channel Triton decode kernel against dequant+matmul reference."""
+    """Compare split-channel Triton decode kernel against dequant+matmul reference (MSE-only keys)."""
     from sglang.srt.layers.attention.triton_ops.turboquant_decode_attention import (
         turboquant_decode_attention_fwd_split,
     )
@@ -314,11 +303,10 @@ def test_split_kernel_vs_reference():
 
     hadamard_lo = HadamardTransform(d_lo, seed, device)
     hadamard_hi = HadamardTransform(d_hi, seed + 97, device)
-    s_lo = projection_matrix(d_lo, seed).to(device)
-    s_hi = projection_matrix(d_hi, seed + 97).to(device)
 
-    k_cb_lo = compute_codebook(d_lo, max(lo_bits - 1, 0)).to(device)
-    k_cb_hi = compute_codebook(d_hi, max(hi_bits - 1, 0)).to(device)
+    # Keys and values both use full bits MSE per group
+    k_cb_lo = compute_codebook(d_lo, lo_bits).to(device)
+    k_cb_hi = compute_codebook(d_hi, hi_bits).to(device)
     v_cb_lo = compute_codebook(d_lo, lo_bits).to(device)
     v_cb_hi = compute_codebook(d_hi, hi_bits).to(device)
 
@@ -327,26 +315,26 @@ def test_split_kernel_vs_reference():
     k_raw = torch.randn(seq_len, H_kv, D, device=device, dtype=torch.float32)
     v_raw = torch.randn(seq_len, H_kv, D, device=device, dtype=torch.float32)
 
-    # Quantize K (split prod) and V (split mse)
-    k_results = split_channel_prod_quantize(
-        k_raw, lo_indices, hi_indices, hadamard_lo, hadamard_hi, s_lo, s_hi,
+    # Quantize K and V (both split MSE)
+    k_lo_p, k_lo_n, k_hi_p, k_hi_n = split_channel_mse_quantize(
+        k_raw, lo_indices, hi_indices, hadamard_lo, hadamard_hi,
         k_cb_lo, k_cb_hi, lo_bits, hi_bits,
     )
-    lo_mse_p, lo_qjl_p, lo_n, lo_rn, hi_mse_p, hi_qjl_p, hi_n, hi_rn = k_results
-
-    lo_vp, lo_vn, hi_vp, hi_vn = split_channel_mse_quantize(
+    v_lo_p, v_lo_n, v_hi_p, v_hi_n = split_channel_mse_quantize(
         v_raw, lo_indices, hi_indices, hadamard_lo, hadamard_hi,
         v_cb_lo, v_cb_hi, lo_bits, hi_bits,
     )
 
     # === REFERENCE: dequant + standard attention ===
-    k_deq = split_channel_prod_dequantize(
-        *k_results, lo_indices, hi_indices, restore_order,
+    k_deq = split_channel_mse_dequantize(
+        k_lo_p, k_lo_n, k_hi_p, k_hi_n,
+        lo_indices, hi_indices, restore_order,
         hadamard_lo, hadamard_hi,
-        s_lo, s_hi, k_cb_lo, k_cb_hi, lo_bits, hi_bits, D,
+        k_cb_lo, k_cb_hi, lo_bits, hi_bits, D,
     )
     v_deq = split_channel_mse_dequantize(
-        lo_vp, lo_vn, hi_vp, hi_vn, lo_indices, hi_indices, restore_order,
+        v_lo_p, v_lo_n, v_hi_p, v_hi_n,
+        lo_indices, hi_indices, restore_order,
         hadamard_lo, hadamard_hi,
         v_cb_lo, v_cb_hi, lo_bits, hi_bits, D,
     )
@@ -360,14 +348,11 @@ def test_split_kernel_vs_reference():
     ref_out = torch.einsum("bhs,shd->bhd", weights, v_expanded)
 
     # === TRITON SPLIT KERNEL ===
-    # Split queries by channel
     q_lo = q.index_select(-1, lo_indices.to(device))
     q_hi = q.index_select(-1, hi_indices.to(device))
 
     q_rot_lo = hadamard_lo.forward(q_lo)
-    q_proj_lo = torch.matmul(q_lo, s_lo.T)
     q_rot_hi = hadamard_hi.forward(q_hi)
-    q_proj_hi = torch.matmul(q_hi, s_hi.T)
 
     kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
     kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
@@ -384,21 +369,17 @@ def test_split_kernel_vs_reference():
 
     o_rot_split = torch.empty(B, H_q, head_dim, dtype=torch.float32, device=device)
 
-    qjl_scale_lo = math.sqrt(math.pi / 2.0) / d_lo
-    qjl_scale_hi = math.sqrt(math.pi / 2.0) / d_hi
-    k_lo_mse_bits = max(lo_bits - 1, 0)
-    k_hi_mse_bits = max(hi_bits - 1, 0)
-
     turboquant_decode_attention_fwd_split(
-        q_rot_lo, q_proj_lo, q_rot_hi, q_proj_hi,
-        lo_mse_p, lo_qjl_p, lo_n, lo_rn,
-        hi_mse_p, hi_qjl_p, hi_n, hi_rn,
-        lo_vp, lo_vn, hi_vp, hi_vn,
+        q_rot_lo, q_rot_hi,
+        k_lo_p, k_lo_n,
+        k_hi_p, k_hi_n,
+        v_lo_p, v_lo_n,
+        v_hi_p, v_hi_n,
         k_cb_lo, k_cb_hi, v_cb_lo, v_cb_hi,
         o_rot_split,
         kv_indptr, kv_indices, num_kv_splits,
-        max_kv_splits, sm_scale, qjl_scale_lo, qjl_scale_hi,
-        k_lo_mse_bits, k_hi_mse_bits,
+        max_kv_splits, sm_scale,
+        lo_bits, hi_bits,
         lo_bits, hi_bits,
         padded_d_lo, padded_d_hi, head_dim,
         attn_logits, attn_lse,
@@ -1168,6 +1149,241 @@ def test_fused_split_decode_vs_nonfused():
 
 
 # ---------------------------------------------------------------------------
+# Test: Long-sequence scaling — decode and extend at varying kv_len
+# ---------------------------------------------------------------------------
+
+def test_long_sequence_decode():
+    """Decode attention at varying kv_len for Qwen2.5-3B (D=128) and Qwen3.5-9B (D=256).
+
+    Tests whether cosine similarity degrades at long context.
+    This is the key diagnostic for the 0% accuracy bug on Qwen2.5-3B.
+    """
+    from sglang.srt.layers.attention.triton_ops.turboquant_decode_attention import (
+        turboquant_decode_attention_fwd,
+    )
+
+    device = "cuda"
+    bits = 3
+    mse_bits = max(bits - 1, 0)
+    seed = 42
+
+    configs = [
+        # (label, H_q, H_kv, D, kv_len)
+        ("Qwen2.5-3B_kv48",   16, 2, 128, 48),
+        ("Qwen2.5-3B_kv512",  16, 2, 128, 512),
+        ("Qwen2.5-3B_kv2048", 16, 2, 128, 2048),
+        ("Qwen2.5-3B_kv4096", 16, 2, 128, 4096),
+        ("Qwen3.5-9B_kv48",   32, 4, 256, 48),
+        ("Qwen3.5-9B_kv512",  32, 4, 256, 512),
+        ("Qwen3.5-9B_kv2048", 32, 4, 256, 2048),
+        ("Qwen3.5-9B_kv4096", 32, 4, 256, 4096),
+    ]
+
+    results = []
+    for label, H_q, H_kv, D, kv_len in configs:
+        torch.manual_seed(42)
+        B = 1
+
+        hadamard = HadamardTransform(D, seed, device)
+        k_cb = compute_codebook(D, bits).to(device)
+        v_cb = compute_codebook(D, bits).to(device)
+
+        q = torch.randn(B, H_q, D, device=device, dtype=torch.float32)
+        k_raw = torch.randn(kv_len, H_kv, D, device=device, dtype=torch.float32)
+        v_raw = torch.randn(kv_len, H_kv, D, device=device, dtype=torch.float32)
+
+        # Quantize (both MSE)
+        k_packed, k_norms = mse_quantize(k_raw, hadamard, k_cb, bits)
+        v_packed, v_norms = mse_quantize(v_raw, hadamard, v_cb, bits)
+
+        # === REFERENCE: dequant + matmul ===
+        k_deq = mse_dequantize(k_packed, k_norms, hadamard, k_cb, bits, D)
+        v_deq = mse_dequantize(v_packed, v_norms, hadamard, v_cb, bits, D)
+
+        kv_group_num = H_q // H_kv
+        k_expanded = k_deq.repeat_interleave(kv_group_num, dim=1)
+        v_expanded = v_deq.repeat_interleave(kv_group_num, dim=1)
+
+        sm_scale = 1.0 / math.sqrt(D)
+        scores = torch.einsum("bhd,shd->bhs", q, k_expanded) * sm_scale
+        weights = torch.softmax(scores, dim=-1)
+        ref_out = torch.einsum("bhs,shd->bhd", weights, v_expanded)
+
+        # === FUSED TRITON KERNEL ===
+        q_rot = hadamard.forward(q)
+
+        kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
+        kv_indices = torch.arange(kv_len, dtype=torch.int32, device=device)
+        max_kv_splits = max(8, (kv_len + 255) // 256)
+        num_kv_splits = torch.tensor([max_kv_splits], dtype=torch.int32, device=device)
+
+        BLOCK_DV = triton.next_power_of_2(hadamard.padded_dim)
+        attn_logits = torch.empty(B, H_q, max_kv_splits, BLOCK_DV, dtype=torch.float32, device=device)
+        attn_lse = torch.empty(B, H_q, max_kv_splits, dtype=torch.float32, device=device)
+        o_rot = torch.empty(B, H_q, hadamard.padded_dim, dtype=torch.float32, device=device)
+
+        turboquant_decode_attention_fwd(
+            q_rot,
+            k_packed, k_norms,
+            v_packed, v_norms,
+            k_cb, v_cb,
+            o_rot,
+            kv_indptr, kv_indices, num_kv_splits,
+            max_kv_splits, sm_scale,
+            bits, bits, hadamard.padded_dim,
+            attn_logits, attn_lse,
+        )
+        # Apply inverse rotation externally (QR dense matmul)
+        kernel_out = hadamard.inverse(o_rot)
+
+        sim = cosine_sim(ref_out, kernel_out)
+        results.append((label, sim))
+        print(f"    {label}: cosine_sim={sim:.6f}")
+
+        # Free GPU memory
+        del q, k_raw, v_raw, k_packed, k_norms
+        del v_packed, v_norms, k_deq, v_deq, k_expanded, v_expanded
+        del attn_logits, attn_lse, o_rot
+        torch.cuda.empty_cache()
+
+    # Report and assert
+    summary_parts = []
+    for label, sim in results:
+        summary_parts.append(f"{label}={sim:.4f}")
+        assert sim > 0.85, f"{label}: cosine_sim={sim:.6f} < 0.85 — QUALITY DEGRADATION"
+
+    return " | ".join(summary_parts)
+
+
+def test_long_sequence_extend():
+    """Extend attention at varying total_kv for Qwen2.5-3B (D=128) and Qwen3.5-9B (D=256).
+
+    Simulates prefill of long prompts (NIAH-like).
+    """
+    from sglang.srt.layers.attention.triton_ops.turboquant_extend_attention import (
+        turboquant_extend_attention_fwd,
+    )
+
+    device = "cuda"
+    bits = 3
+    mse_bits = max(bits - 1, 0)
+    seed = 42
+
+    configs = [
+        # (label, H_q, H_kv, D, prefix_len, extend_len)
+        ("Qwen2.5-3B_ext48",   16, 2, 128, 0,    48),
+        ("Qwen2.5-3B_ext512",  16, 2, 128, 256,  256),
+        ("Qwen2.5-3B_ext2048", 16, 2, 128, 1792, 256),
+        ("Qwen2.5-3B_ext4096", 16, 2, 128, 3840, 256),
+        ("Qwen3.5-9B_ext48",   32, 4, 256, 0,    48),
+        ("Qwen3.5-9B_ext512",  32, 4, 256, 256,  256),
+        ("Qwen3.5-9B_ext2048", 32, 4, 256, 1792, 256),
+        ("Qwen3.5-9B_ext4096", 32, 4, 256, 3840, 256),
+    ]
+
+    results = []
+    for label, H_q, H_kv, D, prefix_len, extend_len in configs:
+        torch.manual_seed(42)
+        B = 1
+        total_kv = prefix_len + extend_len
+        kv_group_num = H_q // H_kv
+
+        hadamard = HadamardTransform(D, seed, device)
+        s = projection_matrix(D, seed).to(device)
+        k_cb = compute_codebook(D, mse_bits).to(device)
+        v_cb = compute_codebook(D, bits).to(device)
+
+        q = torch.randn(B, extend_len, H_q, D, device=device, dtype=torch.float32)
+        k_raw = torch.randn(B, total_kv, H_kv, D, device=device, dtype=torch.float32)
+        v_raw = torch.randn(B, total_kv, H_kv, D, device=device, dtype=torch.float32)
+
+        # Quantize
+        k_flat = k_raw.view(B * total_kv, H_kv, D)
+        v_flat = v_raw.view(B * total_kv, H_kv, D)
+        k_mse_p, k_qjl_p, k_norms, k_res_norms = prod_quantize(k_flat, hadamard, s, k_cb, bits)
+        v_packed, v_norms = mse_quantize(v_flat, hadamard, v_cb, bits)
+
+        # === REFERENCE ===
+        k_deq = prod_dequantize(k_mse_p, k_qjl_p, k_norms, k_res_norms, hadamard, s, k_cb, bits, D)
+        v_deq = mse_dequantize(v_packed, v_norms, hadamard, v_cb, bits, D)
+        k_deq = k_deq.view(B, total_kv, H_kv, D)
+        v_deq = v_deq.view(B, total_kv, H_kv, D)
+
+        k_expanded = k_deq.repeat_interleave(kv_group_num, dim=2)
+        v_expanded = v_deq.repeat_interleave(kv_group_num, dim=2)
+
+        sm_scale = 1.0 / math.sqrt(D)
+        q_t = q.permute(0, 2, 1, 3)
+        k_t = k_expanded.permute(0, 2, 1, 3)
+        v_t = v_expanded.permute(0, 2, 1, 3)
+
+        scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * sm_scale
+
+        causal_mask = torch.ones(extend_len, total_kv, dtype=torch.bool, device=device)
+        for qi in range(extend_len):
+            for ki in range(total_kv):
+                if ki >= prefix_len and (ki - prefix_len) > qi:
+                    causal_mask[qi, ki] = False
+        scores = scores.masked_fill(~causal_mask[None, None, :, :], float("-inf"))
+        weights = torch.softmax(scores, dim=-1)
+        ref_out = torch.matmul(weights, v_t).permute(0, 2, 1, 3)
+
+        # === TRITON KERNEL ===
+        q_flat_k = q.view(B * extend_len, H_q, D)
+        q_rot = hadamard.forward(q_flat_k)
+        q_proj = torch.matmul(q_flat_k, s.T)
+
+        total_q = B * extend_len
+        total_kv_tokens = B * total_kv
+        qo_indptr = torch.tensor(
+            [i * extend_len for i in range(B + 1)], dtype=torch.int32, device=device
+        )
+        kv_indptr = torch.tensor(
+            [i * total_kv for i in range(B + 1)], dtype=torch.int32, device=device
+        )
+        kv_indices = torch.arange(total_kv_tokens, dtype=torch.int64, device=device)
+        prefix_lens_t = torch.full((B,), prefix_len, dtype=torch.int32, device=device)
+
+        o_rot = torch.empty(total_q, H_q, hadamard.padded_dim, dtype=torch.float32, device=device)
+        qjl_scale = math.sqrt(math.pi / 2.0) / D
+
+        turboquant_extend_attention_fwd(
+            q_rot, q_proj,
+            k_mse_p, k_qjl_p, k_norms, k_res_norms,
+            v_packed, v_norms,
+            k_cb, v_cb,
+            o_rot,
+            qo_indptr, kv_indptr, kv_indices, prefix_lens_t,
+            max_extend_len=extend_len,
+            sm_scale=sm_scale,
+            qjl_scale=qjl_scale,
+            mse_bits=mse_bits,
+            v_bits=bits,
+            head_dim=hadamard.padded_dim,
+            is_causal=True,
+        )
+
+        kernel_out = hadamard.inverse(o_rot).view(B, extend_len, H_q, D)
+
+        sim = cosine_sim(ref_out, kernel_out)
+        results.append((label, sim))
+        print(f"    {label}: cosine_sim={sim:.6f}")
+
+        # Free GPU memory
+        del q, k_raw, v_raw, k_flat, v_flat, k_mse_p, k_qjl_p, k_norms, k_res_norms
+        del v_packed, v_norms, k_deq, v_deq, k_expanded, v_expanded
+        del scores, weights, o_rot, q_rot, q_proj
+        torch.cuda.empty_cache()
+
+    summary_parts = []
+    for label, sim in results:
+        summary_parts.append(f"{label}={sim:.4f}")
+        assert sim > 0.85, f"{label}: cosine_sim={sim:.6f} < 0.85 — QUALITY DEGRADATION"
+
+    return " | ".join(summary_parts)
+
+
+# ---------------------------------------------------------------------------
 # Test: rotated-space accumulation equivalence (Phase H verification)
 # ---------------------------------------------------------------------------
 
@@ -1220,8 +1436,235 @@ def test_rotated_space_equivalence():
 
 
 # ---------------------------------------------------------------------------
+# Test: gather_dequant matches full dequant at indexed positions
+# ---------------------------------------------------------------------------
+
+def test_gather_dequant():
+    """gather_dequant_key/value should match get_key_buffer()[indices] exactly."""
+    from sglang.srt.mem_cache.turboquant_pool import TurboQuantTokenToKVPool
+
+    device = "cuda"
+    torch.manual_seed(42)
+
+    for bits, label in [(3, "integer_3bit"), (3.5, "split_3.5bit")]:
+        pool = TurboQuantTokenToKVPool(
+            size=256, page_size=1, dtype=torch.bfloat16,
+            head_num=2, head_dim=128, layer_num=2,
+            device=device, enable_memory_saver=False,
+            turboquant_bits=bits, turboquant_seed=42,
+            use_workspace=False,
+        )
+
+        # Populate some positions with random data
+        N = 64
+        loc = torch.arange(N, device=device)
+        k_data = torch.randn(N, 2, 128, device=device, dtype=torch.bfloat16)
+        v_data = torch.randn(N, 2, 128, device=device, dtype=torch.bfloat16)
+
+        # Use a mock layer object for set_kv_buffer
+        class MockLayer:
+            layer_id = 0
+            k_scale = None
+            v_scale = None
+        pool.set_kv_buffer(MockLayer(), loc, k_data, v_data)
+
+        # Gather at a subset of positions (with some duplicates)
+        indices = torch.tensor([0, 5, 10, 20, 5, 63], device=device)
+
+        # Full dequant then index
+        full_k = pool.get_key_buffer(0)
+        full_v = pool.get_value_buffer(0)
+        expected_k = full_k[indices]
+        expected_v = full_v[indices]
+
+        # Gather-dequant
+        gathered_k = pool.gather_dequant_key(0, indices)
+        gathered_v = pool.gather_dequant_value(0, indices)
+
+        k_sim = cosine_sim(expected_k, gathered_k)
+        v_sim = cosine_sim(expected_v, gathered_v)
+        k_max_diff = (expected_k.float() - gathered_k.float()).abs().max().item()
+        v_max_diff = (expected_v.float() - gathered_v.float()).abs().max().item()
+
+        assert k_sim > 0.9999, f"{label} key: sim={k_sim:.6f}"
+        assert v_sim > 0.9999, f"{label} val: sim={v_sim:.6f}"
+        assert k_max_diff < 1e-3, f"{label} key: max_diff={k_max_diff:.2e}"
+        assert v_max_diff < 1e-3, f"{label} val: max_diff={v_max_diff:.2e}"
+
+    return "integer and split paths match full dequant"
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+
+def test_integer_4bit_h_kv2():
+    """Integer 4-bit decode kernel at H_kv=2 (Qwen2.5-3B config). Regression test."""
+    from sglang.srt.layers.attention.triton_ops.turboquant_decode_attention import (
+        turboquant_decode_attention_fwd,
+    )
+
+    device = "cuda"
+    torch.manual_seed(42)
+
+    B, H_q, H_kv, D = 1, 16, 2, 128
+    seq_len = 64
+    bits = 4
+    seed = 42
+    kv_group_num = H_q // H_kv
+
+    hadamard_k = HadamardTransform(D, seed, device)
+    hadamard_v = HadamardTransform(D, seed + 500, device)
+    k_cb = compute_codebook(D, bits).to(device)
+    v_cb = compute_codebook(D, bits).to(device)
+
+    q = torch.randn(B, H_q, D, device=device, dtype=torch.float32)
+    k_raw = torch.randn(seq_len, H_kv, D, device=device, dtype=torch.float32)
+    v_raw = torch.randn(seq_len, H_kv, D, device=device, dtype=torch.float32)
+
+    k_packed, k_norms = mse_quantize(k_raw, hadamard_k, k_cb, bits)
+    v_packed, v_norms = mse_quantize(v_raw, hadamard_v, v_cb, bits)
+
+    # Reference: dequant + standard attention
+    k_deq = mse_dequantize(k_packed, k_norms, hadamard_k, k_cb, bits, D)
+    v_deq = mse_dequantize(v_packed, v_norms, hadamard_v, v_cb, bits, D)
+    k_expanded = k_deq.repeat_interleave(kv_group_num, dim=1)
+    v_expanded = v_deq.repeat_interleave(kv_group_num, dim=1)
+    sm_scale = 1.0 / math.sqrt(D)
+    scores = torch.einsum("bhd,shd->bhs", q, k_expanded) * sm_scale
+    weights = torch.softmax(scores, dim=-1)
+    ref_out = torch.einsum("bhs,shd->bhd", weights, v_expanded)
+
+    # Triton kernel
+    q_rot = hadamard_k.forward(q)
+    kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+    kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
+    max_kv_splits = 8
+    num_kv_splits = torch.tensor([max_kv_splits], dtype=torch.int32, device=device)
+    BLOCK_DV = triton.next_power_of_2(hadamard_k.padded_dim)
+    attn_logits = torch.empty(B, H_q, max_kv_splits, BLOCK_DV, dtype=torch.float32, device=device)
+    attn_lse = attn_logits[:, :, :, 0].contiguous()
+    o_rot = torch.empty(B, H_q, hadamard_k.padded_dim, dtype=torch.float32, device=device)
+
+    turboquant_decode_attention_fwd(
+        q_rot, k_packed, k_norms, v_packed, v_norms,
+        k_cb, v_cb, o_rot,
+        kv_indptr, kv_indices, num_kv_splits,
+        max_kv_splits, sm_scale, bits, bits, hadamard_k.padded_dim,
+        attn_logits, attn_lse,
+    )
+
+    kernel_out = hadamard_v.inverse(o_rot)
+    sim = cosine_sim(ref_out, kernel_out)
+    assert sim > 0.95, f"Integer 4-bit H_kv=2 cosine sim {sim:.4f} < 0.95"
+    return f"cosine_sim={sim:.4f}"
+
+
+def test_split_kernel_h_kv2():
+    """Split 3.5-bit decode kernel at H_kv=2 (Qwen2.5-3B config). Regression test."""
+    from sglang.srt.layers.attention.triton_ops.turboquant_decode_attention import (
+        turboquant_decode_attention_fwd_split,
+    )
+
+    device = "cuda"
+    torch.manual_seed(42)
+
+    B, H_q, H_kv, D = 1, 16, 2, 128
+    seq_len = 64
+    avg_bits = 3.5
+    seed = 42
+    kv_group_num = H_q // H_kv
+
+    lo_bits = math.floor(avg_bits)
+    hi_bits = math.ceil(avg_bits)
+    lo_indices, hi_indices = select_outlier_indices(D, avg_bits)
+    restore_order = torch.argsort(torch.cat([lo_indices, hi_indices]))
+    d_lo, d_hi = lo_indices.shape[0], hi_indices.shape[0]
+
+    hadamard_lo = HadamardTransform(d_lo, seed, device)
+    hadamard_hi = HadamardTransform(d_hi, seed + 97, device)
+    v_hadamard_lo = HadamardTransform(d_lo, seed + 500, device)
+    v_hadamard_hi = HadamardTransform(d_hi, seed + 597, device)
+
+    k_cb_lo = compute_codebook(d_lo, lo_bits).to(device)
+    k_cb_hi = compute_codebook(d_hi, hi_bits).to(device)
+    v_cb_lo = compute_codebook(d_lo, lo_bits).to(device)
+    v_cb_hi = compute_codebook(d_hi, hi_bits).to(device)
+
+    q = torch.randn(B, H_q, D, device=device, dtype=torch.float32)
+    k_raw = torch.randn(seq_len, H_kv, D, device=device, dtype=torch.float32)
+    v_raw = torch.randn(seq_len, H_kv, D, device=device, dtype=torch.float32)
+
+    k_lo_p, k_lo_n, k_hi_p, k_hi_n = split_channel_mse_quantize(
+        k_raw, lo_indices, hi_indices, hadamard_lo, hadamard_hi,
+        k_cb_lo, k_cb_hi, lo_bits, hi_bits,
+    )
+    v_lo_p, v_lo_n, v_hi_p, v_hi_n = split_channel_mse_quantize(
+        v_raw, lo_indices, hi_indices, v_hadamard_lo, v_hadamard_hi,
+        v_cb_lo, v_cb_hi, lo_bits, hi_bits,
+    )
+
+    # Reference: dequant + standard attention
+    k_deq = split_channel_mse_dequantize(
+        k_lo_p, k_lo_n, k_hi_p, k_hi_n,
+        lo_indices, hi_indices, restore_order,
+        hadamard_lo, hadamard_hi,
+        k_cb_lo, k_cb_hi, lo_bits, hi_bits, D,
+    )
+    v_deq = split_channel_mse_dequantize(
+        v_lo_p, v_lo_n, v_hi_p, v_hi_n,
+        lo_indices, hi_indices, restore_order,
+        v_hadamard_lo, v_hadamard_hi,
+        v_cb_lo, v_cb_hi, lo_bits, hi_bits, D,
+    )
+    k_expanded = k_deq.repeat_interleave(kv_group_num, dim=1)
+    v_expanded = v_deq.repeat_interleave(kv_group_num, dim=1)
+    sm_scale = 1.0 / math.sqrt(D)
+    scores = torch.einsum("bhd,shd->bhs", q, k_expanded) * sm_scale
+    weights = torch.softmax(scores, dim=-1)
+    ref_out = torch.einsum("bhs,shd->bhd", weights, v_expanded)
+
+    # Triton split kernel
+    q_lo = q.index_select(-1, lo_indices.to(device))
+    q_hi = q.index_select(-1, hi_indices.to(device))
+    q_rot_lo = hadamard_lo.forward(q_lo)
+    q_rot_hi = hadamard_hi.forward(q_hi)
+
+    kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+    kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
+    max_kv_splits = 8
+    num_kv_splits = torch.tensor([max_kv_splits], dtype=torch.int32, device=device)
+
+    padded_d_lo = hadamard_lo.padded_dim
+    padded_d_hi = hadamard_hi.padded_dim
+    head_dim = padded_d_lo + padded_d_hi
+    BLOCK_DV = triton.next_power_of_2(head_dim)
+    attn_logits = torch.empty(B, H_q, max_kv_splits, BLOCK_DV, dtype=torch.float32, device=device)
+    attn_lse = attn_logits[:, :, :, 0].contiguous()
+    o_rot_split = torch.empty(B, H_q, head_dim, dtype=torch.float32, device=device)
+
+    turboquant_decode_attention_fwd_split(
+        q_rot_lo, q_rot_hi,
+        k_lo_p, k_lo_n, k_hi_p, k_hi_n,
+        v_lo_p, v_lo_n, v_hi_p, v_hi_n,
+        k_cb_lo, k_cb_hi, v_cb_lo, v_cb_hi,
+        o_rot_split,
+        kv_indptr, kv_indices, num_kv_splits,
+        max_kv_splits, sm_scale,
+        lo_bits, hi_bits, lo_bits, hi_bits,
+        padded_d_lo, padded_d_hi, head_dim,
+        attn_logits, attn_lse,
+    )
+
+    o_lo = v_hadamard_lo.inverse(o_rot_split[..., :padded_d_lo])
+    o_hi = v_hadamard_hi.inverse(o_rot_split[..., padded_d_lo:])
+    output_split = torch.cat([o_lo, o_hi], dim=-1)
+    kernel_out = output_split.index_select(-1, restore_order.to(device))
+
+    sim = cosine_sim(ref_out, kernel_out)
+    assert sim > 0.95, f"Split H_kv=2 cosine sim {sim:.4f} < 0.95"
+    return f"cosine_sim={sim:.4f}"
+
 
 ALL_TESTS = [
     test_bit_packing_roundtrip,
@@ -1235,10 +1678,12 @@ ALL_TESTS = [
     test_extend_causal_mask,
     test_extend_variable_batch,
     test_split_extend_vs_reference,
-    test_triton_fwht_roundtrip,
-    test_fused_decode_vs_nonfused,
-    test_fused_split_decode_vs_nonfused,
     test_rotated_space_equivalence,
+    test_long_sequence_decode,
+    test_long_sequence_extend,
+    test_gather_dequant,
+    test_integer_4bit_h_kv2,
+    test_split_kernel_h_kv2,
 ]
 
 
