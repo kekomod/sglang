@@ -27,34 +27,11 @@ SERVER_CONFIGS = {
         "name": "BF16 Baseline",
         "args": [],
     },
-    "turboquant_3bit": {
-        "name": "TurboQuant 3-bit",
-        "args": [
-            "--kv-cache-quantization", "turboquant",
-            "--turboquant-bits", "3",
-        ],
-    },
     "turboquant_3.5bit": {
         "name": "TurboQuant 3.5-bit",
         "args": [
             "--kv-cache-quantization", "turboquant",
             "--turboquant-bits", "3.5",
-        ],
-    },
-    "turboquant_3.5bit_no_graph": {
-        "name": "TurboQuant 3.5-bit (no graph)",
-        "args": [
-            "--kv-cache-quantization", "turboquant",
-            "--turboquant-bits", "3.5",
-            "--disable-cuda-graph",
-        ],
-    },
-    "turboquant_3.5bit_fused": {
-        "name": "TurboQuant 3.5-bit (fused)",
-        "args": [
-            "--kv-cache-quantization", "turboquant",
-            "--turboquant-bits", "3.5",
-            "--attention-backend", "turboquant",
         ],
     },
 }

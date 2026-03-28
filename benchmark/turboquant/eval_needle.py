@@ -197,7 +197,7 @@ def build_test_case(
     needle_tokens = _token_length(needle_fact, model_path)
 
     # Available tokens for filler
-    available = target_context_tokens - question_tokens - needle_tokens - 20
+    available = target_context_tokens - question_tokens - needle_tokens - 200
     if available < 50:
         available = 50
 

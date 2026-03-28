@@ -85,19 +85,40 @@ def score_example(prediction: str, answers: list[str]) -> float:
 # ---------------------------------------------------------------------------
 
 def load_longbench_subset(subset_name: str, max_examples: int) -> list[dict] | None:
-    """Load a LongBench subset from HuggingFace. Returns None on failure."""
-    try:
-        from datasets import load_dataset
-    except ImportError:
-        print("[longbench] ERROR: `datasets` package not installed. Run: pip install datasets")
-        return None
+    """Load a LongBench subset. Downloads JSONL from HuggingFace hub.
+
+    The old datasets.load_dataset("THUDM/LongBench") API is broken (dataset
+    scripts no longer supported). Instead, downloads data.zip and reads JSONL.
+    """
+    import os
+    import zipfile
 
     try:
-        ds = load_dataset("THUDM/LongBench", subset_name, split="test",
-                          trust_remote_code=True)
-    except Exception as e:
-        print(f"[longbench] WARNING: Failed to load subset '{subset_name}': {e}")
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        print("[longbench] ERROR: `huggingface_hub` not installed. Run: pip install huggingface_hub")
         return None
+
+    # Download and extract data.zip (cached by huggingface_hub)
+    cache_dir = os.path.expanduser("~/.cache/longbench_data")
+    jsonl_path = os.path.join(cache_dir, "data", f"{subset_name}.jsonl")
+
+    if not os.path.exists(jsonl_path):
+        try:
+            zip_path = hf_hub_download(repo_id="THUDM/LongBench", filename="data.zip", repo_type="dataset")
+            os.makedirs(cache_dir, exist_ok=True)
+            with zipfile.ZipFile(zip_path) as z:
+                z.extractall(cache_dir)
+        except Exception as e:
+            print(f"[longbench] WARNING: Failed to download LongBench data: {e}")
+            return None
+
+    if not os.path.exists(jsonl_path):
+        print(f"[longbench] WARNING: Subset '{subset_name}' not found in LongBench data")
+        return None
+
+    with open(jsonl_path) as f:
+        ds = [json.loads(line) for line in f]
 
     examples = []
     for i, item in enumerate(ds):

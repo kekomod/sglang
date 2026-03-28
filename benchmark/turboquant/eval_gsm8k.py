@@ -38,9 +38,9 @@ INVALID = -9999999
 GSM8K_URL = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
 
 NUM_SHOTS = 10
-NUM_EXAMPLES = 50
+NUM_EXAMPLES = 200
 START_INDEX = 10  # skip first 10 (used as few-shot examples)
-NUM_WORKERS = 16
+NUM_WORKERS = 1
 
 
 def get_one_example(lines, i, include_answer):
