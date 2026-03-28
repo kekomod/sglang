@@ -378,7 +378,7 @@ def main():
                         choices=list(SERVER_CONFIGS.keys()),
                         help="Run only this config (requires --base-url)")
     parser.add_argument("--configs", type=str, nargs="+",
-                        default=["bf16", "turboquant_3.5bit", "turboquant_3bit", "turboquant_3.5bit_fused"],
+                        default=["bf16", "turboquant_3.5bit"],
                         choices=list(SERVER_CONFIGS.keys()),
                         help="Configs to benchmark")
     parser.add_argument("--model", type=str, default=None,
@@ -393,6 +393,8 @@ def main():
                         help="Concurrent requests (default: 16)")
     parser.add_argument("--warmup", type=int, default=2,
                         help="Warmup requests before timing (default: 2)")
+    parser.add_argument("--context-length", type=int, default=8192,
+                        help="Server context length (default: 8192)")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--output-dir", type=str, default="results")
     parser.add_argument("--seed", type=int, default=SEED)
@@ -437,7 +439,7 @@ def main():
         proc = None
         try:
             proc = launch_server(config_name, port=args.port, timeout=300,
-                                 context_length=8192, model_path=args.model)
+                                 context_length=args.context_length, model_path=args.model)
             base_url = f"http://127.0.0.1:{args.port}"
             mem_launch = get_gpu_memory_mb()
             metrics = run_benchmark(base_url, images=images, text_prompts=text_prompts,

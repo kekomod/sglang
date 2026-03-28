@@ -25,12 +25,9 @@ from sglang.srt.layers.quantization.turboquant.codebook import compute_codebook
 from sglang.srt.layers.quantization.turboquant.quant_ops import (
     mse_dequantize,
     mse_quantize,
-    prod_dequantize,
-    prod_quantize,
 )
 from sglang.srt.layers.quantization.turboquant.rotation import (
     HadamardTransform,
-    projection_matrix,
 )
 
 
@@ -87,34 +84,6 @@ def measure_mse_distortion(
     diff = (x.float() - x_hat.float())
     mse_per_vec = (diff ** 2).sum(dim=-1) / (x.float() ** 2).sum(dim=-1).clamp(min=1e-12)
     mse_per_vec = mse_per_vec.squeeze(-1)  # [N]
-
-    return {
-        "mean": mse_per_vec.mean().item(),
-        "std": mse_per_vec.std().item(),
-        "x_hat": x_hat,
-    }
-
-
-def measure_prod_distortion(
-    x: torch.Tensor, dim: int, bits: int, device: torch.device,
-) -> dict:
-    """Quantize with TQ_prod and measure MSE distortion."""
-    hadamard = HadamardTransform(dim, seed=42, device=device)
-    mse_bits = max(bits - 1, 0)
-    mse_codebook = compute_codebook(hadamard.padded_dim, mse_bits).to(device)
-    s_matrix = projection_matrix(dim, seed=42).to(device)
-
-    mse_packed, qjl_packed, norms, res_norms = prod_quantize(
-        x, hadamard, s_matrix, mse_codebook, bits,
-    )
-    x_hat = prod_dequantize(
-        mse_packed, qjl_packed, norms, res_norms,
-        hadamard, s_matrix, mse_codebook, bits, dim,
-    )
-
-    diff = (x.float() - x_hat.float())
-    mse_per_vec = (diff ** 2).sum(dim=-1) / (x.float() ** 2).sum(dim=-1).clamp(min=1e-12)
-    mse_per_vec = mse_per_vec.squeeze(-1)
 
     return {
         "mean": mse_per_vec.mean().item(),
@@ -188,47 +157,35 @@ def main():
         mse_res = measure_mse_distortion(x, dim, bits, device)
         mse_ip = measure_inner_product_distortion(x, mse_res["x_hat"], args.num_pairs)
 
-        # TQ_prod
-        prod_res = measure_prod_distortion(x, dim, bits, device)
-        prod_ip = measure_inner_product_distortion(x, prod_res["x_hat"], args.num_pairs)
-
         results.append({
             "bits": bits,
             "theoretical_mse": theo_mse,
             "mse_quant": mse_res,
-            "prod_quant": prod_res,
             "mse_ip": mse_ip,
-            "prod_ip": prod_ip,
         })
 
         print(f"\n  MSE Distortion (||x - x̂||² / ||x||²):")
         print(f"    Theoretical bound:  {theo_mse:.6f}")
         print(f"    TQ_mse measured:    {mse_res['mean']:.6f} ± {mse_res['std']:.6f}")
-        print(f"    TQ_prod measured:   {prod_res['mean']:.6f} ± {prod_res['std']:.6f}")
 
         print(f"\n  Inner Product Distortion (<x̂_i,x̂_j> - <x_i,x_j>):")
         print(f"    TQ_mse  — bias: {mse_ip['bias']:+.6f}  var: {mse_ip['variance']:.6f}  RMSE: {mse_ip['rmse']:.6f}")
-        print(f"    TQ_prod — bias: {prod_ip['bias']:+.6f}  var: {prod_ip['variance']:.6f}  RMSE: {prod_ip['rmse']:.6f}")
 
     # Summary table
     print(f"\n{'='*70}")
     print(f"  SUMMARY TABLE")
     print(f"{'='*70}")
-    header = f"{'Bits':>5} {'Method':<10} {'Theo MSE':>10} {'Meas MSE':>10} {'MSE Std':>10} {'IP Bias':>10} {'IP RMSE':>10}"
+    header = f"{'Bits':>5} {'Theo MSE':>10} {'Meas MSE':>10} {'MSE Std':>10} {'IP Bias':>10} {'IP RMSE':>10}"
     print(header)
     print("-" * len(header))
     for r in results:
         bits = r["bits"]
         theo = r["theoretical_mse"]
-        for method, mse_key, ip_key in [
-            ("TQ_mse", "mse_quant", "mse_ip"),
-            ("TQ_prod", "prod_quant", "prod_ip"),
-        ]:
-            meas = r[mse_key]["mean"]
-            std = r[mse_key]["std"]
-            bias = r[ip_key]["bias"]
-            rmse = r[ip_key]["rmse"]
-            print(f"{bits:>5} {method:<10} {theo:>10.6f} {meas:>10.6f} {std:>10.6f} {bias:>+10.6f} {rmse:>10.6f}")
+        meas = r["mse_quant"]["mean"]
+        std = r["mse_quant"]["std"]
+        bias = r["mse_ip"]["bias"]
+        rmse = r["mse_ip"]["rmse"]
+        print(f"{bits:>5} {theo:>10.6f} {meas:>10.6f} {std:>10.6f} {bias:>+10.6f} {rmse:>10.6f}")
 
     print(f"\n[distortion] Done. {n} vectors, dim={dim}, device={device}")
 

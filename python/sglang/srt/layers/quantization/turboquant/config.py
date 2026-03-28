@@ -7,7 +7,7 @@ vector quantization based on random rotation + scalar codebook.
 Reference: arXiv:2504.19874 (ICLR 2026)
 """
 
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -23,11 +23,9 @@ from sglang.srt.layers.quantization.turboquant.kv_cache_method import (
 class TurboQuantConfig(QuantizationConfig):
     """Configuration for TurboQuant KV cache quantization.
 
-    TurboQuant compresses the KV cache using:
-    - Keys: TurboQuant_prod (b-1 bits MSE + 1-bit QJL) for unbiased inner products
-    - Values: TurboQuant_mse (b bits MSE) for optimal reconstruction
-
-    Enabled via --kv-cache-quantization turboquant.
+    TurboQuant compresses the KV cache using MSE-optimal quantization
+    (Algorithm 1) for both keys and values. Enabled via
+    --kv-cache-quantization turboquant.
     """
 
     def __init__(self, bits: float = 3, seed: int = 42):

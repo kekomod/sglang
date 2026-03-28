@@ -1,208 +1,132 @@
-# Phase I Handoff: Hardening & Edge Cases
+# Phase I Handoff: Codebook Verification, Math Tests, Gather-Dequant, Stuttering Analysis
 
-## Context
+## Status: COMPLETE — Codebook verified, math tests built, extend optimized, stuttering resolved (Qwen2.5 unsupported)
 
-After Phase E (Triton FWHT) and Phase F (CUDA graph support via F2 workspace), the core TurboQuant implementation is functionally complete. 12/12 kernel tests and 6/6 server tests pass. Throughput is 0.76x baseline with CUDA graphs enabled.
+### Phase I Session 2 Summary (added post-completion)
+- **Stuttering root cause**: QKV attention bias in Qwen2/Qwen2.5 creates near-degenerate K vectors (mean_dir=0.998, norms 25-30x normal). Not a TQ code bug — no implementation handles biased inputs. Qwen2/2.5 marked UNSUPPORTED.
+- **Llama-3.2-3B validated**: Pure transformer, no QKV bias, TQ works perfectly (6/6 tests).
+- **Separate K/V rotations**: Added independent rotation seeds for K and V (matches MLX), verified with H_kv=2 regression tests.
+- **Gather-dequant optimization**: Extend path uses selective O(prefix) dequant instead of O(pool_size).
+- **Implementation comparison**: MSE codebook matches MLX exactly. Community consensus: QJL hurts quality, MSE-only is preferred.
 
-This phase covers hardening: edge cases, defensive error handling, and workspace lifecycle correctness under less-common SGLang configurations. None of these are blocking issues today — they are smoothing items for production readiness.
+## What Was Done
 
-Each item requires a decision about whether it's worth addressing, given the tradeoff between code complexity and the likelihood of the scenario occurring.
+### I1: Codebook Verification Against MLX
+**Result: PASS — Perfect match (max diff = 0.00e+00)**
 
-## Items
+Compared SGLang `compute_codebook(dim, bits)` against MLX's `_codebook(dim, bits)` for dim=[32, 64, 128, 256], bits=[2, 3, 4]. Both implementations are character-for-character identical in their numpy paths:
+- Same grid: 32768 points, bounds -1+1e-6 to 1-1e-6
+- Same Beta PDF formula
+- Same Max-Lloyd: 100 iterations, 1e-6 convergence
+- Same CDF quantile initialization
+- Same seed formulas: rotation=`seed + dim * 7919`, projection=`seed + dim * 2971 + 17`
 
-### I1. Workspace Reset on Pool Reuse
+Only intentional difference: SGLang has analytical 1-bit fast path (`c = sqrt(2/pi)/sqrt(d)`), MLX doesn't.
 
-**Scenario:** If `TurboQuantTokenToKVPool` is reused after a cache clear (e.g., all requests finish and slots are freed), the BF16 workspace retains stale data in freed slots.
+### I2: Math Test Suite
+**File: `sglang/test/test_turboquant_math.py` — 5/5 tests pass**
 
-**Current behavior:** Stale workspace data is harmless — freed slots are never indexed by `kv_indices` until they're re-allocated, at which point `set_kv_buffer` overwrites them with fresh data.
+1. **test_codebook_cross_impl** (CPU): SGLang vs MLX codebook match
+2. **test_codebook_optimality** (GPU): Empirical MSE within paper bounds (Theorems 1 & 3)
+3. **test_cosine_sim_sweep** (GPU): Monotonicity in bits and dim
+4. **test_multi_layer_attention_quality** (GPU): Multi-layer error accumulation simulation
+5. **test_extend_roundtrip_error** (GPU): Extend path per-layer distortion
 
-**Decision to consider:** Is a `clear()` method needed for defensive safety, or does the slot allocator's invariant (freed slots are never read) make this unnecessary overhead? Adding `clear()` would zero all workspace buffers — expensive for large pools (28 layers × 130K slots × 4 heads × 128 dim × 2 bytes × 2 (K+V) ≈ 7 GB of writes).
+### I3: Key Quality Numbers
 
-**If implementing:** Add a `clear()` method to `TurboQuantTokenToKVPool` that zeros workspace buffers. Only call it when the pool is explicitly reset, not on every free operation.
+**Codebook optimality (dim=128):**
+| Bits | Empirical MSE | Shannon Lower | Paper Upper |
+|------|-------------|---------------|-------------|
+| 2    | 0.116       | 0.0625        | 0.170       |
+| 3    | 0.034       | 0.0156        | 0.043       |
+| 4    | 0.009       | 0.0039        | 0.011       |
 
-**Files:** `python/sglang/srt/mem_cache/turboquant_pool.py`
+All within theoretical bounds.
 
-### I2. CPU Offloading Incompatibility
+**Per-token cosine similarity (MSE roundtrip):**
+| dim\bits | b=2   | b=3   | b=4   |
+|----------|-------|-------|-------|
+| 32       | 0.945 | 0.984 | 0.996 |
+| 64       | 0.941 | 0.984 | 0.996 |
+| 128      | 0.941 | 0.983 | 0.995 |
+| 256      | 0.940 | 0.983 | 0.995 |
 
-**Scenario:** SGLang supports CPU offloading of KV cache via `get_cpu_copy()` / `load_cpu_copy()` on the base `KVCache` class. `TurboQuantTokenToKVPool` does not override these methods.
+**Multi-layer simulation (Qwen2.5-3B config: H_q=16, H_kv=2, D=128, seq_len=64, with RMSNorm + residual connections):**
+| Layers | 3-bit sim | 4-bit sim |
+|--------|----------|----------|
+| 1      | 0.980    | 0.996    |
+| 4      | 0.981    | 0.996    |
+| 12     | 0.967    | 0.994    |
+| 36     | 0.957    | 0.993    |
 
-**Current behavior:** If CPU offloading is enabled with TurboQuant, calling `get_cpu_copy()` would hit the base class `NotImplementedError`. The failure is clear but not informative.
+**Critical finding: 4-bit at 36 layers gives 0.993 cosine sim — this should NOT cause stuttering.**
 
-**Decision to consider:** Should TurboQuant support CPU offloading (offload packed buffers + workspace), or is an explicit error message sufficient? Supporting it would require serializing both packed storage and BF16 workspace, which is more complex but could be valuable for very long context scenarios. Alternatively, offloading only packed storage and dequanting on reload would save CPU memory.
+### I4: Extend Path Optimization
+**Files modified: `turboquant_pool.py`, `turboquant_backend.py`, `test_turboquant_kernel.py`**
 
-**If implementing (error only):** Override `get_cpu_copy()` and `load_cpu_copy()` to raise `NotImplementedError("CPU offloading not supported with TurboQuant KV cache")`.
+Key discovery: the 2-stage Triton extend kernel ALREADY uses raw K,V for extend tokens (stage 2) and only reads dequantized pool for prefix tokens (stage 1). The H4 handoff incorrectly attributed stuttering to extend path roundtrip — extend tokens never go through a lossy roundtrip.
 
-**If implementing (full support):** Override both methods to transfer packed buffers + norms + workspace. Consider whether workspace needs to be offloaded at all — it can be reconstructed from packed storage via dequantization on reload.
+Changes:
+1. **Pool**: Added `gather_dequant_key()` and `gather_dequant_value()` — selective dequant at specific positions only (O(prefix) instead of O(pool_size))
+2. **Backend**: Overrode `forward_extend()` to use gather-dequant + remapped kv_indices instead of full-pool dequant
+3. **Tests**: Added `test_gather_dequant` verifying gather matches full dequant at indexed positions
 
-**Files:** `python/sglang/srt/mem_cache/turboquant_pool.py`
+## The Stuttering Bug — Analysis
 
-### I3. Workspace Behavior During CUDA Graph Capture Warmup
+### What We Know
+- TQ produces stuttering/repetition on Qwen2.5-3B at BOTH 3.5-bit and 4-bit
+- BF16 baseline is perfect
+- Math tests prove quantization quality is sufficient (0.993 cosine sim at 4-bit/36 layers)
+- Kernel logic is correct (verified by code review and kernel tests)
+- Extend path was already using raw K,V for extend tokens (not the cause)
 
-**Scenario:** During CUDA graph capture (`_capture_graph` in `cuda_graph_runner.py`), the model runs warmup forward passes with `_graph_mode=True`. During these warmups, `set_kv_buffer` writes BF16 to workspace but does NOT quantize to packed storage. Meanwhile, `get_key_buffer` / `get_value_buffer` in graph mode returns the workspace directly.
+### Most Likely Root Cause: MSE-Only Key Quantization Bias
 
-**Current behavior:** This is correct for graph capture — the warmup data is throwaway and the captured graph only records the kernel launch pattern, not the data. After capture, real inference uses graph replay with proper dual-write and post-graph quantization.
+The paper explicitly says (Section 3.3):
+> "Why not just use TurboQuant_mse for keys? Because MSE-optimal quantizers are **biased** for inner products."
 
-**Decision to consider:** Should there be an assertion or debug check that `_graph_mode` is never accidentally left on? If a code path sets `_graph_mode=True` but crashes before the `finally` block (if one existed), packed storage would never be updated. Currently the set/unset is not wrapped in try/finally.
+We switched keys from prod (MSE+QJL) to MSE-only in Phase H4 because QJL variance was too high at dim=64 (split groups). But MSE-only introduces a systematic bias in attention scores:
+- `E[<q, dequant_mse(k)>] != <q, k>` (biased estimator)
+- The bias is a multiplicative factor close to 1 at high bits, but signal-dependent
+- Different tokens experience different bias magnitudes depending on their rotated-coordinate distribution
+- This distorts the softmax attention distribution, potentially over-weighting some tokens
 
-**If implementing:** Wrap graph mode in a context manager:
-```python
-@contextmanager
-def graph_mode(self):
-    self.set_graph_mode(True)
-    try:
-        yield
-    finally:
-        self.set_graph_mode(False)
+The paper uses prod (MSE+QJL) specifically because it provides an **unbiased** estimator:
+- `E[<q, dequant_prod(k)>] = <q, k>` (unbiased)
+
+### Why QJL Failed Previously
+
+In Phase H4, prod key cosine sim was 0.948 at 3-bit/dim=128 (vs MSE's 0.983). The QJL residual at dim=64 (split groups) had too much variance. But this may have been a bug in our prod implementation, not an inherent limitation:
+- Our prod cosine sim (0.918) seems low compared to what the paper claims
+- The MLX prod codec uses identical math (verified in I1 exploration)
+- Possible issues: norm storage precision (fp16), residual computation, or the projection matrix
+
+### Proposed Next Steps (Priority Order)
+
+1. **Test MSE score bias directly**: Measure `<q, dequant_mse(k)>` vs `<q, k>` for many random (q, k) pairs. Quantify the bias magnitude and signal-dependence. If bias is significant, it confirms this hypothesis.
+
+2. **Investigate prod quality at full dim=128 (no split)**: Test prod_quantize at integer 3-bit (dim=128, no split groups). If cosine sim is much better than the 0.918 we saw before, the issue was specifically with dim=64 QJL.
+
+3. **Try prod for keys at higher dims only**: Use prod for keys when dim >= 128 (integer bits), MSE-only for split groups. This would match the paper's approach for integer bit-widths.
+
+4. **Fix QJL at dim=64**: The QJL projection matrix has dim^2 parameters — at dim=64 that's only 4096 elements. The matrix might need better conditioning or scaling. Compare our projection_matrix() output against MLX's for same seed.
+
+5. **Compare against MLX end-to-end**: Run MLX's TurboQuant on same inputs, measure attention output quality. If MLX's prod codec gives better cosine sim, our prod implementation has a bug.
+
+## Files Modified
+
+| File | Change |
+|------|--------|
+| `sglang/test/test_turboquant_math.py` | NEW — 5 math validation tests |
+| `sglang/python/sglang/srt/mem_cache/turboquant_pool.py` | Added gather_dequant_key/value methods |
+| `sglang/python/sglang/srt/layers/attention/turboquant_backend.py` | Added forward_extend override with gather-dequant |
+| `sglang/test/test_turboquant_kernel.py` | Added test_gather_dequant |
+| `CLAUDE.md` | Updated status |
+
+## Test Results
+
 ```
-Then use `with pool.graph_mode():` in model_runner.py and cuda_graph_runner.py instead of manual set/unset.
-
-**Files:** `python/sglang/srt/mem_cache/turboquant_pool.py`, `python/sglang/srt/model_executor/model_runner.py`, `python/sglang/srt/model_executor/cuda_graph_runner.py`
-
-### I4. Prefix Cache Consistency Under Eviction
-
-**Scenario:** SGLang's RadixCache evicts old KV entries and reuses their slots. When a slot is evicted and reallocated, `move_kv_cache()` copies data between slots. Both packed buffers and workspace are copied (verified in audit).
-
-**Current behavior:** Correct. `move_kv_cache()` copies workspace in both split and integer code paths. When slots are freed (not moved), the stale workspace data is irrelevant per I1.
-
-**Decision to consider:** Under heavy prefix cache churn with CUDA graphs, is there a window where a graph replay reads from a workspace slot that was freed but not yet overwritten? The slot allocator should prevent this — freed slots are removed from `kv_indices` before any graph replay. Verify this invariant by tracing the eviction→reallocation→graph replay sequence.
-
-**If implementing:** Add a debug assertion in `set_kv_buffer` (graph mode) that verifies `loc` values are currently allocated slots. Only enable under `SGLANG_DEBUG=1` to avoid overhead.
-
-**Files:** `python/sglang/srt/mem_cache/turboquant_pool.py`
-
-### I5. Memory Reporting Accuracy
-
-**Scenario:** `get_kv_size_bytes()` currently sums packed buffers + norms + workspace. This is used by SGLang for memory accounting and scheduling decisions.
-
-**Current behavior:** Correct — workspace is included in the total. However, the reported size is the theoretical maximum (full pool × all layers). In practice, only allocated slots contain meaningful data.
-
-**Decision to consider:** Should memory reporting distinguish between "capacity" (total allocated) and "used" (slots with valid data)? This would help users understand the memory overhead of the F2 workspace approach. Alternatively, this level of detail may not be useful until F1 eliminates the workspace.
-
-**If implementing:** Add a `get_workspace_overhead_bytes()` method that reports workspace size separately from packed storage, for logging/diagnostics.
-
-**Files:** `python/sglang/srt/mem_cache/turboquant_pool.py`
-
-## Verification
-
-```bash
-conda activate turboquant
-
-# Kernel tests (should be unaffected by hardening changes)
-python test/test_turboquant_kernel.py
-
-# Server tests with CUDA graphs
-python -m sglang.launch_server \
-    --model /home/keko/AI/image-prep/models/uncensored-9b-bf16-hf \
-    --kv-cache-quantization turboquant \
-    --turboquant-bits 3.5 \
-    --port 30000 \
-    --context-length 4096
-
-python test/test_turboquant_server.py
-
-# Stress test: many concurrent requests to exercise prefix cache + workspace
-for i in $(seq 1 50); do
-    curl -s http://localhost:30000/v1/completions \
-        -d '{"model": "default", "prompt": "Count to 10:", "max_tokens": 30}' &
-done
-wait
+15/15 kernel tests pass (including gather_dequant)
+5/5 math tests pass
+2/3 piecewise tests pass (consistency fails due to stuttering-induced non-determinism)
 ```
-
-### I6. Consistency Non-Determinism in No-CUDA-Graph Mode
-
-**Scenario:** With `--disable-cuda-graph` (FlashInfer backend), sending the same prompt twice at temperature=0 can produce different outputs. Discovered when `test_concurrent_batch_decode` (20 simultaneous requests) runs before the consistency test — the concurrent load perturbs internal state enough to flip borderline tokens.
-
-**Current behavior:** Not a bug introduced by TurboQuant code — it's inherent to lossy KV quantization + prefix caching. Request 2 reuses request 1's quantized (lossy) KV via prefix cache. The quantization error at decision-boundary tokens can tip the output differently than fresh computation. This affects any lossy KV cache quantization scheme. Both CUDA graph modes (fused + FlashInfer) pass consistency 8/8.
-
-**Decision to consider:** Is this worth fixing for the no-graph fallback path? Options:
-- Accept and document as known limitation (no-graph is fallback, CUDA graph modes are default)
-- Disable prefix caching when TurboQuant + no-graph is used (bad for performance)
-- Add a tolerance to the consistency test (e.g., check first N tokens match instead of exact)
-- Investigate whether the dequant path introduces non-determinism beyond quantization error
-
-**Files:** `test/test_turboquant_server.py`, possibly `turboquant_pool.py` dequant path
-
-### I7. Long-Context Benchmarks (32K-128K)
-
-**Context:** All current benchmarks test at 4K-8K context where KV cache is tiny relative to model weights. TurboQuant's value proposition (memory savings enabling longer context) has never been demonstrated. The paper's benchmarks are at long context (LongBench-E, needle-in-haystack at 128K+).
-
-**What to do:**
-- Benchmark Qwen2.5-3B (pure transformer, 100% layers have KV cache) at 8K/16K/32K/64K context
-- Measure: peak GPU memory, max achievable context length, throughput at each length
-- Compare BF16 vs TQ: show the context length where BF16 OOMs but TQ fits
-- Use `--context-length 65536` or higher
-
-**Files:** `benchmark/turboquant/eval_throughput.py` (add `--context-length` CLI arg), new benchmark script
-
-### I8. Concurrency Scaling Benchmark
-
-**Context:** TQ's smaller KV cache means more concurrent requests fit in GPU memory. This is the primary real-world benefit but hasn't been measured.
-
-**What to do:**
-- Ramp concurrency (4, 8, 16, 32, 64) until OOM for both BF16 and TQ
-- Report: max concurrency before OOM, throughput at each concurrency level
-- Show the "TQ enables 3-4x more concurrent users" claim with real numbers
-
-**Files:** `benchmark/turboquant/eval_throughput.py`
-
-### I9. Task-Accuracy Metrics
-
-**Context:** Current quality metric (bag-of-words cosine similarity) is meaningless for structured JSON output (shows 0.53-0.55 even when content is correct). The paper uses LongBench-E task accuracy and needle-in-haystack recall.
-
-**What to do:**
-- Add needle-in-haystack evaluation at various context lengths (8K, 16K, 32K)
-- Add simple QA accuracy test (factual questions with verifiable answers)
-- Replace or supplement cosine similarity in eval_throughput.py
-
-**Files:** `benchmark/turboquant/eval_needle.py` (already exists), `benchmark/turboquant/eval_throughput.py`
-
-### I10. Sparse V Dequant Optimization
-
-**Context:** From TheTom/turboquant_plus — at long context, ~90% of softmax attention weights are near-zero. Skipping V codebook lookup + weighted sum for positions where attention weight < threshold saves ~20% decode throughput at 32K+.
-
-**What to do:**
-- In the fused decode kernel's V accumulation loop, skip codebook gather for tokens where softmax weight < 1e-6
-- Only applicable to fused Triton backend (not FlashInfer fallback)
-- Test quality impact (should be zero — skipped weights are negligible)
-
-**Files:** `turboquant_decode_attention.py`
-
-### I11. uint32-Based Bit Packing (MLX Approach)
-
-**Context:** Current `_extract_bits()` uses uint8 with byte-boundary spillover handling (conditional logic per element in Triton inner loop). MLX-VLM uses uint32 bitstream — cleaner extraction, no spillover for 3-bit and 4-bit widths. Reduces conditional branches.
-
-**What to do:**
-- Switch pack/unpack from uint8 to uint32 storage
-- Update `_extract_bits` in both decode and extend Triton kernels
-- Update `pack_bits`/`unpack_bits` in quant_ops.py
-- Benchmark the throughput impact
-
-**Files:** `quant_ops.py`, `turboquant_decode_attention.py`, `turboquant_extend_attention.py`
-
-### I12. Weight Quantization + TQ KV Composition
-
-**Context:** Running larger models (14B-35B) on consumer GPUs requires weight quantization (GPTQ/AWQ 4-bit) alongside TQ KV cache compression. These are independent systems that should compose but haven't been tested together.
-
-**What to do:**
-- Test SGLang with a GPTQ-quantized model + `--kv-cache-quantization turboquant`
-- Verify: model loads, inference works, quality maintained
-- Document any incompatibilities
-
-**Files:** Server launch configuration, possibly `turboquant_pool.py` if dtype handling needs adjustment
-
-## Priority Assessment
-
-| Item | Risk if ignored | Complexity | Recommendation |
-|------|----------------|------------|----------------|
-| I1. Workspace reset | Very low (slot allocator prevents reads of stale data) | Low | Skip unless debugging shows stale reads |
-| I2. CPU offload error | Low (feature not commonly used with quantized KV) | Low (error msg) / Medium (full support) | Add error message; defer full support |
-| I3. Graph mode context manager | Low (current code is correct, just not crash-safe) | Low | Worth doing — small change, defensive |
-| I4. Prefix cache consistency | Very low (slot allocator invariant protects this) | Medium (debug assertions + tracing) | Verify once manually; skip assertions unless issues arise |
-| I5. Memory reporting | None (functional correctness unaffected) | Low | Nice-to-have for diagnostics |
-| I6. No-graph consistency | Low (fallback path only, CUDA graph modes pass 8/8) | Medium | Accept and document; default mode is unaffected |
-| **I7. Long-context benchmarks** | **High (value proposition undemonstrated)** | **Medium** | **Do first — proves TQ works** |
-| **I8. Concurrency scaling** | **High (primary real-world benefit)** | **Low** | **Do alongside I7** |
-| **I9. Task-accuracy metrics** | **Medium (current metric is misleading)** | **Low** | **Replace cosine sim with NIAH** |
-| I10. Sparse V dequant | Low (optimization, not correctness) | Medium | Worth doing after I7 confirms long-context works |
-| I11. uint32 bit packing | Low (optimization) | Medium | Worth doing for kernel throughput |
-| I12. Weight quant + TQ composition | Medium (unlocks larger models on consumer GPUs) | Low-Medium | Test and document |

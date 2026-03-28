@@ -26,17 +26,15 @@ This is the extend counterpart to turboquant_decode_attention.py:
 Phase A: integer bits (e.g. 3-bit). Single set of buffers.
 """
 
-import logging
-
 import torch
 import triton
 import triton.language as tl
 
-logger = logging.getLogger(__name__)
-
 
 # =============================================================================
-# Bit extraction helpers (copied from turboquant_decode_attention.py)
+# Bit extraction helpers — intentionally duplicated from turboquant_decode_attention.py.
+# Triton JIT cross-file imports can cause compilation caching issues, so these
+# are kept as independent copies. Changes must be synced manually.
 # =============================================================================
 
 
@@ -1076,143 +1074,3 @@ def turboquant_extend_attention_fwd_split(
         num_stages=num_stages,
     )
 
-
-# =============================================================================
-# FUSED Python wrappers: extend + inline inverse FWHT (Phase H2.9)
-# =============================================================================
-
-
-def turboquant_extend_attention_fused_fwd(
-    q_rot: torch.Tensor,            # [T, H_q, D] pre-rotated queries (float32)
-    q_proj: torch.Tensor,           # [T, H_q, D] pre-projected queries (float32)
-    signs: torch.Tensor,            # [padded_dim] Hadamard sign vector
-    hadamard_scale: float,          # 1/sqrt(padded_dim)
-    original_dim: int,              # original head_dim (for truncation)
-    k_mse_buffer: torch.Tensor,
-    k_qjl_buffer: torch.Tensor,
-    k_norms: torch.Tensor,
-    k_res_norms: torch.Tensor,
-    v_packed_buffer: torch.Tensor,
-    v_norms: torch.Tensor,
-    k_codebook: torch.Tensor,
-    v_codebook: torch.Tensor,
-    o: torch.Tensor,                # [T, H_q, padded_dim] output buffer
-    qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    prefix_lens: torch.Tensor,
-    max_extend_len: int,
-    sm_scale: float,
-    qjl_scale: float,
-    mse_bits: int,
-    v_bits: int,
-    head_dim: int,
-    is_causal: bool = True,
-):
-    """TurboQuant extend with post-kernel inverse FWHT (Phase H2.9).
-
-    Calls the original extend kernel, then applies inverse Hadamard transform.
-    Output o is de-rotated — caller just truncates to original_dim.
-
-    Values accumulated in rotated space — inverse applied ONCE (Phase H).
-    """
-    from sglang.srt.layers.quantization.turboquant.triton_fwht import (
-        triton_fwht_inverse,
-    )
-
-    # Original extend kernel → o gets rotated-space output
-    turboquant_extend_attention_fwd(
-        q_rot, q_proj,
-        k_mse_buffer, k_qjl_buffer, k_norms, k_res_norms,
-        v_packed_buffer, v_norms,
-        k_codebook, v_codebook,
-        o,
-        qo_indptr, kv_indptr, kv_indices, prefix_lens,
-        max_extend_len, sm_scale, qjl_scale,
-        mse_bits, v_bits, head_dim, is_causal,
-    )
-
-    # Inverse FWHT on output (standalone kernel — efficient for many rows)
-    o_inv = triton_fwht_inverse(o, signs, head_dim, original_dim, hadamard_scale)
-    o.copy_(o_inv)
-
-
-def turboquant_extend_attention_fused_fwd_split(
-    q_rot_lo: torch.Tensor,        # [T, H_q, D_lo] pre-rotated (float32)
-    q_proj_lo: torch.Tensor,
-    q_rot_hi: torch.Tensor,        # [T, H_q, D_hi] pre-rotated (float32)
-    q_proj_hi: torch.Tensor,
-    signs_lo: torch.Tensor,        # [padded_D_lo]
-    signs_hi: torch.Tensor,        # [padded_D_hi]
-    hadamard_scale_lo: float,
-    hadamard_scale_hi: float,
-    original_dim_lo: int,
-    original_dim_hi: int,
-    k_mse_lo: torch.Tensor,
-    k_qjl_lo: torch.Tensor,
-    k_norms_lo: torch.Tensor,
-    k_res_norms_lo: torch.Tensor,
-    k_mse_hi: torch.Tensor,
-    k_qjl_hi: torch.Tensor,
-    k_norms_hi: torch.Tensor,
-    k_res_norms_hi: torch.Tensor,
-    v_packed_lo: torch.Tensor,
-    v_norms_lo: torch.Tensor,
-    v_packed_hi: torch.Tensor,
-    v_norms_hi: torch.Tensor,
-    k_cb_lo: torch.Tensor,
-    k_cb_hi: torch.Tensor,
-    v_cb_lo: torch.Tensor,
-    v_cb_hi: torch.Tensor,
-    o_split: torch.Tensor,         # [T, H_q, padded_D_lo+padded_D_hi] output buffer
-    qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    prefix_lens: torch.Tensor,
-    max_extend_len: int,
-    sm_scale: float,
-    qjl_scale_lo: float,
-    qjl_scale_hi: float,
-    mse_bits_lo: int,
-    mse_bits_hi: int,
-    v_bits_lo: int,
-    v_bits_hi: int,
-    d_lo: int,
-    d_hi: int,
-    head_dim: int,
-    is_causal: bool = True,
-):
-    """Split-channel extend with post-kernel per-group inverse FWHT (Phase H2.9).
-
-    Output o_split is de-rotated in split order [lo | hi].
-    """
-    from sglang.srt.layers.quantization.turboquant.triton_fwht import (
-        triton_fwht_inverse,
-    )
-
-    padded_d_lo = q_rot_lo.shape[-1]
-    padded_d_hi = q_rot_hi.shape[-1]
-
-    # Original split extend kernel → o_split gets rotated-space output
-    turboquant_extend_attention_fwd_split(
-        q_rot_lo, q_proj_lo, q_rot_hi, q_proj_hi,
-        k_mse_lo, k_qjl_lo, k_norms_lo, k_res_norms_lo,
-        k_mse_hi, k_qjl_hi, k_norms_hi, k_res_norms_hi,
-        v_packed_lo, v_norms_lo, v_packed_hi, v_norms_hi,
-        k_cb_lo, k_cb_hi, v_cb_lo, v_cb_hi,
-        o_split,
-        qo_indptr, kv_indptr, kv_indices, prefix_lens,
-        max_extend_len, sm_scale, qjl_scale_lo, qjl_scale_hi,
-        mse_bits_lo, mse_bits_hi, v_bits_lo, v_bits_hi,
-        d_lo, d_hi, head_dim, is_causal,
-    )
-
-    # Inverse FWHT per group
-    o_lo_rot = o_split[..., :padded_d_lo].contiguous()
-    o_hi_rot = o_split[..., padded_d_lo:padded_d_lo + padded_d_hi].contiguous()
-
-    o_lo_inv = triton_fwht_inverse(o_lo_rot, signs_lo, padded_d_lo, original_dim_lo, hadamard_scale_lo)
-    o_hi_inv = triton_fwht_inverse(o_hi_rot, signs_hi, padded_d_hi, original_dim_hi, hadamard_scale_hi)
-
-    o_split[..., :padded_d_lo].copy_(o_lo_inv)
-    o_split[..., padded_d_lo:padded_d_lo + padded_d_hi].copy_(o_hi_inv)

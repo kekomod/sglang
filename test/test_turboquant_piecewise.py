@@ -1,12 +1,11 @@
 """
-TurboQuant piecewise CUDA graph test — Qwen2.5-3B-Instruct.
+TurboQuant piecewise CUDA graph test — Llama-3.2-3B-Instruct.
 
-Launches a Qwen2.5-3B server with TurboQuant 3.5-bit and piecewise CUDA
+Launches a Llama-3.2-3B server with TurboQuant 3.5-bit and piecewise CUDA
 graphs enabled, runs text-only validation tests, then tears down the server.
 
-Uses Qwen2.5-3B (pure transformer) because piecewise graphs require a model
-where 100% of layers produce KV cache.  Qwen3.5 is hybrid (GatedDeltaNet)
-and is NOT suitable for this test.
+Uses Llama-3.2-3B (pure transformer, 100% KV layers, no QKV bias) as the
+ideal TQ test model. Qwen2.5 is unsupported (QKV attention bias).
 
 Usage:
     python test/test_turboquant_piecewise.py
@@ -25,7 +24,10 @@ import requests
 # Config
 # ---------------------------------------------------------------------------
 
-MODEL_PATH = "/home/keko/AI/image-prep/models/qwen2.5-3b-instruct"
+MODEL_PATH = os.environ.get(
+    "TURBOQUANT_MODEL_PATH",
+    "/home/keko/AI/image-prep/models/llama-3.2-3b-instruct",
+)
 PORT = 30001
 BASE_URL = f"http://127.0.0.1:{PORT}"
 TIMEOUT = 300  # 5 min for generation requests

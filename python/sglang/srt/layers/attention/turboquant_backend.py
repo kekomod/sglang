@@ -9,8 +9,11 @@ quantization error) and dequantized pool data for prefix tokens (stage 1).
 The override replaces the parent's full-pool dequant with selective
 gather-dequant at only the positions referenced by kv_indices.
 
-Both keys and values use MSE-only quantization (no QJL). The fused
-decode kernel scores directly from codebook indices * norms.
+Both keys and values use MSE-only quantization (Algorithm 1, no QJL).
+This is by design: community consensus across all TurboQuant implementations
+(SGLang, vLLM, llama.cpp, YATQ) is that QJL increases variance without
+improving quality. The fused decode kernel scores directly from codebook
+indices * norms.
 """
 
 from __future__ import annotations

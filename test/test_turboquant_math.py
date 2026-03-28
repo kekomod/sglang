@@ -21,8 +21,6 @@ from sglang.srt.layers.quantization.turboquant.codebook import (
 from sglang.srt.layers.quantization.turboquant.quant_ops import (
     mse_dequantize,
     mse_quantize,
-    prod_dequantize,
-    prod_quantize,
     select_outlier_indices,
     split_channel_mse_dequantize,
     split_channel_mse_quantize,
@@ -30,7 +28,6 @@ from sglang.srt.layers.quantization.turboquant.quant_ops import (
 )
 from sglang.srt.layers.quantization.turboquant.rotation import (
     HadamardTransform,
-    projection_matrix,
 )
 
 
@@ -525,104 +522,12 @@ def test_extend_roundtrip_error():
 # Test 6: MSE vs Prod inner-product bias (GPU) — KEY DIAGNOSTIC
 # ---------------------------------------------------------------------------
 
-def test_inner_product_bias():
-    """Measure MSE vs prod inner-product bias directly.
-
-    Paper Section 3.3: MSE-optimal quantizers are biased for inner products.
-    Prod (MSE+QJL) is unbiased: E[<y, dequant_prod(k)>] = <y, k>.
-
-    Measures regression slope (alpha: quant_score ~ alpha * true_score),
-    signal-dependent correlation, and compares MSE vs prod at dim=128.
-    """
-    device = "cuda"
-    D = 128
-    N = 10000
-    H = 1
-    seed = 42
-    torch.manual_seed(seed)
-
-    q = torch.randn(N, H, D, device=device)
-    k = torch.randn(N, H, D, device=device)
-
-    true_score = (q * k).sum(dim=-1).squeeze(-1)  # [N]
-
-    results = {}
-
-    for bits in [2, 3, 4]:
-        hadamard = HadamardTransform(D, seed=seed, device=device)
-        codebook = compute_codebook(D, bits).to(device)
-
-        # MSE path
-        packed, norms = mse_quantize(k, hadamard, codebook, bits)
-        k_mse = mse_dequantize(packed, norms, hadamard, codebook, bits, D)
-        mse_score = (q * k_mse).sum(dim=-1).squeeze(-1)
-
-        # Prod path
-        s_matrix = projection_matrix(D, seed).to(device)
-        mse_bits_for_prod = max(bits - 1, 0)
-        prod_cb = compute_codebook(D, mse_bits_for_prod).to(device) if mse_bits_for_prod > 0 else torch.zeros(1, device=device)
-
-        mse_p, qjl_p, norms_prod, res_norms = prod_quantize(
-            k, hadamard, s_matrix, prod_cb, bits
-        )
-        k_prod = prod_dequantize(
-            mse_p, qjl_p, norms_prod, res_norms,
-            hadamard, s_matrix, prod_cb, bits, D
-        )
-        prod_score = (q * k_prod).sum(dim=-1).squeeze(-1)
-
-        ts = true_score.float()
-
-        for name, qs, k_hat in [("mse", mse_score, k_mse), ("prod", prod_score, k_prod)]:
-            qs_f = qs.float()
-            # Regression: qs ~ alpha * ts + beta
-            ts_centered = ts - ts.mean()
-            alpha = (ts_centered * (qs_f - qs_f.mean())).mean() / (ts_centered ** 2).mean()
-            beta = qs_f.mean() - alpha * ts.mean()
-
-            error = qs_f - ts
-            corr = torch.corrcoef(torch.stack([ts, error]))[0, 1].item()
-
-            pred = alpha * ts + beta
-            ss_res = ((qs_f - pred) ** 2).sum()
-            ss_tot = ((qs_f - qs_f.mean()) ** 2).sum()
-            r2 = 1 - (ss_res / ss_tot).item()
-
-            results[(bits, name)] = {
-                'alpha': alpha.item(),
-                'beta': beta.item(),
-                'mean_error': error.mean().item(),
-                'std_error': error.std().item(),
-                'signal_corr': corr,
-                'r2': r2,
-                'cosine_sim': _per_vector_cosine_sim(k, k_hat),
-            }
-
-    print("    bits  method  alpha    beta       mean_err   std_err   sig_corr  R²      cos_sim")
-    for bits in [2, 3, 4]:
-        for method in ["mse", "prod"]:
-            r = results[(bits, method)]
-            print(f"    {bits}     {method:4s}    {r['alpha']:.4f}   {r['beta']:+.6f}  {r['mean_error']:+.6f}  {r['std_error']:.4f}    {r['signal_corr']:+.4f}    {r['r2']:.4f}   {r['cosine_sim']:.4f}")
-
-    mse_alphas = [results[(b, 'mse')]['alpha'] for b in [2, 3, 4]]
-    prod_alphas = [results[(b, 'prod')]['alpha'] for b in [2, 3, 4]]
-
-    return (
-        f"MSE alpha: b2={mse_alphas[0]:.4f}, b3={mse_alphas[1]:.4f}, b4={mse_alphas[2]:.4f}; "
-        f"Prod alpha: b2={prod_alphas[0]:.4f}, b3={prod_alphas[1]:.4f}, b4={prod_alphas[2]:.4f}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 7: Attention distribution distortion (GPU)
-# ---------------------------------------------------------------------------
-
 def test_attention_distribution_distortion():
-    """Measure how MSE bias distorts softmax attention vs prod.
+    """Measure how MSE quantization distorts softmax attention distributions.
 
-    Simulates realistic GQA attention (Qwen2.5-3B config). Compares
-    softmax distributions from true vs MSE-quantized vs prod-quantized keys.
-    Measures KL divergence, top-1 accuracy, entropy shift.
+    Simulates realistic GQA attention. Compares softmax distributions from
+    true vs MSE-quantized keys. Measures KL divergence, top-1 accuracy,
+    entropy shift.
     """
     device = "cuda"
     D = 128
@@ -641,8 +546,6 @@ def test_attention_distribution_distortion():
     for bits in [3, 4]:
         hadamard = HadamardTransform(D, seed=seed, device=device)
         codebook = compute_codebook(D, bits).to(device)
-        s_matrix = projection_matrix(D, seed).to(device)
-        prod_cb = compute_codebook(D, max(bits - 1, 0)).to(device)
 
         Q = torch.randn(num_queries, H_q, D, device=device)
         K = torch.randn(seq_len, H_kv, D, device=device)
@@ -651,52 +554,42 @@ def test_attention_distribution_distortion():
         packed_m, norms_m = mse_quantize(K, hadamard, codebook, bits)
         K_mse = mse_dequantize(packed_m, norms_m, hadamard, codebook, bits, D)
 
-        # Prod quantize
-        mp, qp, np_, rn = prod_quantize(K, hadamard, s_matrix, prod_cb, bits)
-        K_prod = prod_dequantize(mp, qp, np_, rn, hadamard, s_matrix, prod_cb, bits, D)
-
         # Expand KV heads for GQA
         K_exp = K.repeat_interleave(gqa_ratio, dim=1)
         K_mse_exp = K_mse.repeat_interleave(gqa_ratio, dim=1)
-        K_prod_exp = K_prod.repeat_interleave(gqa_ratio, dim=1)
 
         # Attention scores: [num_queries, H_q, seq_len]
         scores_true = torch.einsum("qhd,shd->qhs", Q, K_exp) * sm_scale
         scores_mse = torch.einsum("qhd,shd->qhs", Q, K_mse_exp) * sm_scale
-        scores_prod = torch.einsum("qhd,shd->qhs", Q, K_prod_exp) * sm_scale
 
         attn_true = torch.softmax(scores_true, dim=-1)
         attn_mse = torch.softmax(scores_mse, dim=-1)
-        attn_prod = torch.softmax(scores_prod, dim=-1)
 
         eps = 1e-10
         kl_mse = (attn_true * (attn_true.clamp(min=eps).log() - attn_mse.clamp(min=eps).log())).sum(dim=-1).mean().item()
-        kl_prod = (attn_true * (attn_true.clamp(min=eps).log() - attn_prod.clamp(min=eps).log())).sum(dim=-1).mean().item()
 
         top1_true = attn_true.argmax(dim=-1)
         top1_acc_mse = (top1_true == attn_mse.argmax(dim=-1)).float().mean().item()
-        top1_acc_prod = (top1_true == attn_prod.argmax(dim=-1)).float().mean().item()
 
         ent_true = -(attn_true * attn_true.clamp(min=eps).log()).sum(dim=-1).mean().item()
         ent_mse = -(attn_mse * attn_mse.clamp(min=eps).log()).sum(dim=-1).mean().item()
-        ent_prod = -(attn_prod * attn_prod.clamp(min=eps).log()).sum(dim=-1).mean().item()
 
         results[bits] = {
-            'kl_mse': kl_mse, 'kl_prod': kl_prod,
-            'top1_mse': top1_acc_mse, 'top1_prod': top1_acc_prod,
-            'ent_true': ent_true, 'ent_mse': ent_mse, 'ent_prod': ent_prod,
+            'kl_mse': kl_mse,
+            'top1_mse': top1_acc_mse,
+            'ent_true': ent_true, 'ent_mse': ent_mse,
         }
 
-    print("    bits  metric       MSE        Prod       True")
+    print("    bits  metric       MSE        True")
     for bits in [3, 4]:
         r = results[bits]
-        print(f"    {bits}     KL div       {r['kl_mse']:.6f}   {r['kl_prod']:.6f}")
-        print(f"    {bits}     Top-1 acc    {r['top1_mse']:.4f}     {r['top1_prod']:.4f}")
-        print(f"    {bits}     Entropy      {r['ent_mse']:.4f}     {r['ent_prod']:.4f}     {r['ent_true']:.4f}")
+        print(f"    {bits}     KL div       {r['kl_mse']:.6f}")
+        print(f"    {bits}     Top-1 acc    {r['top1_mse']:.4f}")
+        print(f"    {bits}     Entropy      {r['ent_mse']:.4f}     {r['ent_true']:.4f}")
 
     return (
-        f"b3: KL mse={results[3]['kl_mse']:.6f} prod={results[3]['kl_prod']:.6f}; "
-        f"b4: KL mse={results[4]['kl_mse']:.6f} prod={results[4]['kl_prod']:.6f}"
+        f"b3: KL={results[3]['kl_mse']:.6f}, top1={results[3]['top1_mse']:.4f}; "
+        f"b4: KL={results[4]['kl_mse']:.6f}, top1={results[4]['top1_mse']:.4f}"
     )
 
 
@@ -859,7 +752,6 @@ GPU_TESTS = [
     test_cosine_sim_sweep,
     test_multi_layer_attention_quality,
     test_extend_roundtrip_error,
-    test_inner_product_bias,
     test_attention_distribution_distortion,
     test_fused_vs_dequant_consistency,
 ]

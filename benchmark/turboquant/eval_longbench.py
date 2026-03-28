@@ -128,15 +128,12 @@ def load_longbench_subset(subset_name: str, max_examples: int) -> list[dict] | N
     return examples
 
 
-def build_prompt(example: dict) -> str:
+def build_prompt(example: dict, max_context_chars: int | None = None) -> str:
     """Build the evaluation prompt for a LongBench example."""
     context = example["context"]
     question = example["input"]
 
-    # Truncate very long contexts to avoid exceeding context window
-    # (~6K tokens budget for context, rough 4 chars/token estimate)
-    max_context_chars = 24000
-    if len(context) > max_context_chars:
+    if max_context_chars is not None and len(context) > max_context_chars:
         context = context[:max_context_chars] + "\n[...truncated...]"
 
     return f"Context: {context}\n\n{question}\n\nAnswer concisely."
@@ -151,10 +148,11 @@ def evaluate_subset(
     subset_name: str,
     examples: list[dict],
     num_workers: int = NUM_WORKERS,
+    max_context_chars: int | None = None,
 ) -> dict:
     """Evaluate a single subset. Returns metrics dict with per-example details."""
     predictions = [None] * len(examples)
-    prompts = [build_prompt(ex) for ex in examples]
+    prompts = [build_prompt(ex, max_context_chars=max_context_chars) for ex in examples]
 
     def generate_one(idx):
         try:
@@ -207,6 +205,7 @@ def run_longbench(
     base_url: str,
     max_examples: int = MAX_EXAMPLES_PER_SUBSET,
     num_workers: int = NUM_WORKERS,
+    max_context_chars: int | None = None,
 ) -> dict:
     """Run LongBench-E evaluation across all categories.
 
@@ -225,7 +224,7 @@ def run_longbench(
                 continue
 
             print(f"[longbench] Evaluating {subset_name} ({len(examples)} examples)")
-            result = evaluate_subset(base_url, subset_name, examples, num_workers)
+            result = evaluate_subset(base_url, subset_name, examples, num_workers, max_context_chars)
             all_subset_results[subset_name] = result
             subset_f1s.append(result["avg_f1"])
             print(f"[longbench] {subset_name}: F1 = {result['avg_f1']:.4f}")
@@ -316,6 +315,10 @@ def main():
                         help=f"Max examples per subset (default: {MAX_EXAMPLES_PER_SUBSET})")
     parser.add_argument("--num-workers", type=int, default=NUM_WORKERS,
                         help=f"Concurrent generation workers (default: {NUM_WORKERS})")
+    parser.add_argument("--context-length", type=int, default=8192,
+                        help="Server context length (default: 8192)")
+    parser.add_argument("--max-context-chars", type=int, default=None,
+                        help="Truncate context to N chars (default: no truncation)")
     parser.add_argument("--output-dir", type=str, default="results")
     args = parser.parse_args()
 
@@ -324,7 +327,7 @@ def main():
     if args.base_url and args.config:
         # Single run against existing server
         print(f"\n[longbench] Evaluating {args.config} at {args.base_url}")
-        metrics = run_longbench(args.base_url, args.max_examples, args.num_workers)
+        metrics = run_longbench(args.base_url, args.max_examples, args.num_workers, args.max_context_chars)
         save_results("longbench", args.config, metrics, args.output_dir)
         all_metrics[args.config] = metrics
         print_longbench_table(all_metrics)
@@ -344,11 +347,11 @@ def main():
                 config_name,
                 port=args.port,
                 timeout=300,
-                context_length=8192,
+                context_length=args.context_length,
                 model_path=args.model,
             )
             base_url = f"http://127.0.0.1:{args.port}"
-            metrics = run_longbench(base_url, args.max_examples, args.num_workers)
+            metrics = run_longbench(base_url, args.max_examples, args.num_workers, args.max_context_chars)
             save_results("longbench", config_name, metrics, args.output_dir)
             all_metrics[config_name] = metrics
         except Exception as e:
