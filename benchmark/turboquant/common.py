@@ -41,11 +41,13 @@ DEFAULT_TIMEOUT = 300
 REQUEST_TIMEOUT = 300  # 5 min — Qwen3.5 <think> mode can produce long reasoning
 MAX_RETRIES = 3
 
-# Paper targets (arXiv:2504.19874)
+# Paper targets (arXiv:2504.19874, Section 4)
+# The paper only evaluates: distortion (4.1), NIAH (4.2), LongBench-E (4.3),
+# near neighbor search (4.4). Models: Llama-3.1-8B-Instruct, Ministral-7B-Instruct.
+# GSM8K, perplexity, throughput are NOT in the paper.
 TARGETS = {
-    "perplexity": {"max_ppl_increase_pct": 5.0},
-    "needle": {"min_accuracy": 0.95},
-    "gsm8k": {"max_accuracy_drop_pct": 2.0},
+    "needle": {"min_accuracy": 0.95},  # Paper: TQ=0.997 (matches FP baseline)
+    "longbench": {"max_avg_f1_drop_pct": 2.0},  # Paper: TQ@3.5bit=50.06 (matches FP 50.06)
 }
 
 
@@ -287,15 +289,6 @@ def check_target(
     if targets is None:
         return True, "No target defined."
 
-    if benchmark_name == "perplexity":
-        base_ppl = baseline_metrics["perplexity"]
-        quant_ppl = quant_metrics["perplexity"]
-        increase_pct = (quant_ppl - base_ppl) / base_ppl * 100
-        threshold = targets["max_ppl_increase_pct"]
-        passed = increase_pct <= threshold
-        msg = f"PPL increase: {increase_pct:.2f}% (threshold: {threshold}%)"
-        return passed, msg
-
     if benchmark_name == "needle":
         acc = quant_metrics["accuracy"]
         threshold = targets["min_accuracy"]
@@ -303,13 +296,13 @@ def check_target(
         msg = f"Accuracy: {acc:.3f} (threshold: {threshold})"
         return passed, msg
 
-    if benchmark_name == "gsm8k":
-        base_acc = baseline_metrics["accuracy"]
-        quant_acc = quant_metrics["accuracy"]
-        drop_pct = (base_acc - quant_acc) / base_acc * 100 if base_acc > 0 else 0
-        threshold = targets["max_accuracy_drop_pct"]
+    if benchmark_name == "longbench":
+        base_f1 = baseline_metrics.get("overall_avg_f1", 0)
+        quant_f1 = quant_metrics.get("overall_avg_f1", 0)
+        drop_pct = (base_f1 - quant_f1) / base_f1 * 100 if base_f1 > 0 else 0
+        threshold = targets["max_avg_f1_drop_pct"]
         passed = drop_pct <= threshold
-        msg = f"Accuracy drop: {drop_pct:.2f}% (threshold: {threshold}%)"
+        msg = f"Avg F1 drop: {drop_pct:.2f}% (threshold: {threshold}%)"
         return passed, msg
 
-    return True, "Unknown benchmark."
+    return True, "No paper target for this benchmark."
