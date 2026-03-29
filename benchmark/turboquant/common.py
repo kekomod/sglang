@@ -92,12 +92,21 @@ def launch_server(
     ]
 
     print(f"[common] Launching server ({cfg['name']}): {' '.join(cmd)}")
+
+    # Write server logs to file instead of PIPE to prevent buffer deadlock.
+    # PIPE buffers fill up (~64KB) and block the server's stdout writes.
+    log_dir = Path(os.environ.get("TURBOQUANT_LOG_DIR", "/tmp"))
+    log_path = log_dir / f"sglang_server_{config_name}_{port}.log"
+    log_file = open(log_path, "w")
+    print(f"[common] Server log: {log_path}")
+
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
         preexec_fn=os.setsid,
     )
+    proc._log_file = log_file  # attach for cleanup
 
     base_url = f"http://127.0.0.1:{port}"
     if not wait_for_health(base_url, timeout):
@@ -112,6 +121,14 @@ def launch_server(
 
 def shutdown_server(proc: subprocess.Popen) -> None:
     """Kill the server process tree."""
+    # Close log file if attached
+    log_file = getattr(proc, '_log_file', None)
+    if log_file:
+        try:
+            log_file.close()
+        except Exception:
+            pass
+
     if proc.poll() is not None:
         return
     try:
