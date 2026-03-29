@@ -1,0 +1,88 @@
+{
+  "benchmark": "memory_scaling",
+  "model": "/home/keko/AI/image-prep/models/llama-3.2-3b-instruct",
+  "context_lengths": [
+    4096,
+    8192,
+    16384,
+    32768,
+    65536
+  ],
+  "configs": [
+    "bf16",
+    "turboquant_3.5bit"
+  ],
+  "results": {
+    "bf16_4096": {
+      "config": "bf16",
+      "context_length": 4096,
+      "oom": false,
+      "mem_launch_mb": 21228,
+      "mem_steady_mb": 21228
+    },
+    "bf16_8192": {
+      "config": "bf16",
+      "context_length": 8192,
+      "oom": false,
+      "mem_launch_mb": 21292,
+      "mem_steady_mb": 21292
+    },
+    "bf16_16384": {
+      "config": "bf16",
+      "context_length": 16384,
+      "oom": false,
+      "mem_launch_mb": 21402,
+      "mem_steady_mb": 21402
+    },
+    "bf16_32768": {
+      "config": "bf16",
+      "context_length": 32768,
+      "oom": false,
+      "mem_launch_mb": 21420,
+      "mem_steady_mb": 21420
+    },
+    "bf16_65536": {
+      "config": "bf16",
+      "context_length": 65536,
+      "oom": false,
+      "mem_launch_mb": 21684,
+      "mem_steady_mb": 21684
+    },
+    "turboquant_3.5bit_4096": {
+      "config": "turboquant_3.5bit",
+      "context_length": 4096,
+      "oom": false,
+      "mem_launch_mb": 13518,
+      "mem_steady_mb": 13518
+    },
+    "turboquant_3.5bit_8192": {
+      "config": "turboquant_3.5bit",
+      "context_length": 8192,
+      "oom": false,
+      "mem_launch_mb": 13580,
+      "mem_steady_mb": 13580
+    },
+    "turboquant_3.5bit_16384": {
+      "config": "turboquant_3.5bit",
+      "context_length": 16384,
+      "oom": false,
+      "mem_launch_mb": 13690,
+      "mem_steady_mb": 13690
+    },
+    "turboquant_3.5bit_32768": {
+      "config": "turboquant_3.5bit",
+      "context_length": 32768,
+      "oom": false,
+      "mem_launch_mb": 13718,
+      "mem_steady_mb": 13718
+    },
+    "turboquant_3.5bit_65536": {
+      "config": "turboquant_3.5bit",
+      "context_length": 65536,
+      "oom": false,
+      "mem_launch_mb": 13976,
+      "mem_steady_mb": 13976
+    }
+  },
+  "timestamp": "2026-03-28T21:30:50"
+}

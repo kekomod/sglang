@@ -1,0 +1,126 @@
+{
+  "benchmark": "needle",
+  "config": "bf16",
+  "config_name": "BF16 Baseline",
+  "metrics": {
+    "accuracy": 1.0,
+    "correct": 15,
+    "total": 15,
+    "accuracy_by_context_length": {
+      "4096": 1.0,
+      "8192": 1.0,
+      "16384": 1.0,
+      "32768": "OOM"
+    },
+    "mem_launch_mb": 21420,
+    "mem_steady_mb": 21444,
+    "details": [
+      {
+        "context_length": 4096,
+        "depth": 0.1,
+        "expected": "847293",
+        "response": "847293.",
+        "correct": true
+      },
+      {
+        "context_length": 4096,
+        "depth": 0.25,
+        "expected": "Springfield",
+        "response": "Springfield.",
+        "correct": true
+      },
+      {
+        "context_length": 4096,
+        "depth": 0.5,
+        "expected": "March 15th 2027",
+        "response": "March 15th 2027.",
+        "correct": true
+      },
+      {
+        "context_length": 4096,
+        "depth": 0.75,
+        "expected": "Elena Vasquez",
+        "response": "Dr. Elena Vasquez",
+        "correct": true
+      },
+      {
+        "context_length": 4096,
+        "depth": 0.9,
+        "expected": "42000",
+        "response": "42000 units.",
+        "correct": true
+      },
+      {
+        "context_length": 8192,
+        "depth": 0.1,
+        "expected": "847293",
+        "response": "847293.",
+        "correct": true
+      },
+      {
+        "context_length": 8192,
+        "depth": 0.25,
+        "expected": "Springfield",
+        "response": "Springfield.",
+        "correct": true
+      },
+      {
+        "context_length": 8192,
+        "depth": 0.5,
+        "expected": "March 15th 2027",
+        "response": "March 15th 2027.",
+        "correct": true
+      },
+      {
+        "context_length": 8192,
+        "depth": 0.75,
+        "expected": "Elena Vasquez",
+        "response": "Dr. Elena Vasquez.",
+        "correct": true
+      },
+      {
+        "context_length": 8192,
+        "depth": 0.9,
+        "expected": "42000",
+        "response": "42000 units.",
+        "correct": true
+      },
+      {
+        "context_length": 16384,
+        "depth": 0.1,
+        "expected": "847293",
+        "response": "847293.",
+        "correct": true
+      },
+      {
+        "context_length": 16384,
+        "depth": 0.25,
+        "expected": "Springfield",
+        "response": "Springfield.",
+        "correct": true
+      },
+      {
+        "context_length": 16384,
+        "depth": 0.5,
+        "expected": "March 15th 2027",
+        "response": "March 15th 2027.",
+        "correct": true
+      },
+      {
+        "context_length": 16384,
+        "depth": 0.75,
+        "expected": "Elena Vasquez",
+        "response": "Dr. Elena Vasquez.",
+        "correct": true
+      },
+      {
+        "context_length": 16384,
+        "depth": 0.9,
+        "expected": "42000",
+        "response": "42000 units.",
+        "correct": true
+      }
+    ]
+  },
+  "timestamp": "2026-03-28T21:32:09"
+}

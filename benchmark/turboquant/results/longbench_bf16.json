@@ -1,0 +1,18 @@
+{
+  "benchmark": "longbench",
+  "config": "bf16",
+  "config_name": "BF16 Baseline",
+  "metrics": {
+    "category_scores": {
+      "SingleQA": 0.0,
+      "MultiQA": 0.0,
+      "Summarization": 0.0,
+      "Few-shot": 0.0,
+      "Synthetic": 0.0,
+      "Code": 0.0
+    },
+    "overall_avg_f1": 0.0,
+    "subset_results": {}
+  },
+  "timestamp": "2026-03-27T23:27:36"
+}

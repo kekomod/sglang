@@ -1,0 +1,13 @@
+{
+  "benchmark": "gsm8k",
+  "config": "turboquant_3.5bit",
+  "config_name": "TurboQuant 3.5-bit",
+  "metrics": {
+    "accuracy": 0.62,
+    "correct": 31,
+    "total": 50,
+    "invalid": 0,
+    "elapsed_seconds": 13.9
+  },
+  "timestamp": "2026-03-28T21:40:09"
+}
