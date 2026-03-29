@@ -2,7 +2,7 @@
 TurboQuant Paper Validation — Run All Benchmarks
 
 Replicates the experimental results from arXiv:2504.19874.
-Runs: distortion, perplexity, NIAH, GSM8K.
+Runs: distortion, NIAH, LongBench-E, GSM8K.
 
 Each sub-benchmark handles its own server lifecycle when in multi-config
 mode. This master script orchestrates the order and aggregates results.
@@ -10,7 +10,7 @@ mode. This master script orchestrates the order and aggregates results.
 Usage:
     python run_paper_validation.py
     python run_paper_validation.py --model /path/to/model --configs bf16 turboquant_3.5bit
-    python run_paper_validation.py --benchmarks perplexity gsm8k  # run subset
+    python run_paper_validation.py --benchmarks needle gsm8k  # run subset
 """
 
 import argparse
@@ -33,11 +33,6 @@ BENCHMARK_SPECS = {
         "script": "eval_distortion.py",
         "description": "Quantization Distortion (Section 4.1)",
         "needs_server": False,
-    },
-    "perplexity": {
-        "script": "eval_perplexity.py",
-        "description": "Wikitext-2 Perplexity",
-        "needs_server": True,
     },
     "needle": {
         "script": "eval_needle.py",
@@ -123,29 +118,15 @@ def load_result_json(output_dir: str, benchmark: str, config: str) -> dict | Non
     return None
 
 
-def format_ppl_row(config: str, metrics: dict, baseline_ppl: float | None) -> str:
-    """Format a perplexity result row."""
-    name = SERVER_CONFIGS.get(config, {}).get("name", config)
-    ppl = metrics.get("perplexity", "N/A")
-    if isinstance(ppl, (int, float)) and baseline_ppl and config != "bf16":
-        increase = (ppl - baseline_ppl) / baseline_ppl * 100
-        threshold = TARGETS["perplexity"]["max_ppl_increase_pct"]
-        mark = "v" if increase <= threshold else "X"
-        return f"  {name:<25} PPL = {ppl:.4f} ({increase:+.1f}%)  {mark}"
-    return f"  {name:<25} PPL = {ppl:.4f}" if isinstance(ppl, (int, float)) else f"  {name:<25} PPL = {ppl}"
-
-
 def format_gsm8k_row(config: str, metrics: dict, baseline_acc: float | None) -> str:
-    """Format a GSM8K result row."""
+    """Format a GSM8K result row. GSM8K is NOT in the paper — informational only."""
     name = SERVER_CONFIGS.get(config, {}).get("name", config)
     acc = metrics.get("accuracy", "N/A")
     if isinstance(acc, (int, float)):
         acc_pct = acc * 100
         if baseline_acc and config != "bf16":
             drop = (baseline_acc - acc) / baseline_acc * 100
-            threshold = TARGETS["gsm8k"]["max_accuracy_drop_pct"]
-            mark = "v" if drop <= threshold else "X"
-            return f"  {name:<25} Accuracy = {acc_pct:.1f}% ({drop:+.1f}%)  {mark}"
+            return f"  {name:<25} Accuracy = {acc_pct:.1f}% ({drop:+.1f}%)"
         return f"  {name:<25} Accuracy = {acc_pct:.1f}%"
     return f"  {name:<25} Accuracy = {acc}"
 
@@ -208,22 +189,6 @@ def print_unified_summary(
                     print(f"  {bits}-bit MSE: {mse}")
         else:
             print("  (no results)")
-
-    # --- Perplexity ---
-    if "perplexity" in benchmarks_run:
-        print(f"\nPerplexity (Wikitext-2):")
-        baseline_ppl = None
-        bf16_data = load_result_json(output_dir, "perplexity", "bf16")
-        if bf16_data:
-            baseline_ppl = bf16_data.get("metrics", {}).get("perplexity")
-
-        for config in configs:
-            data = load_result_json(output_dir, "perplexity", config)
-            if data:
-                print(format_ppl_row(config, data["metrics"], baseline_ppl))
-            else:
-                name = SERVER_CONFIGS.get(config, {}).get("name", config)
-                print(f"  {name:<25} (no results)")
 
     # --- Needle ---
     if "needle" in benchmarks_run:
@@ -296,10 +261,6 @@ def main():
         default=[4096, 8192, 16384, 32768],
         help="Context lengths for NIAH benchmark",
     )
-    parser.add_argument(
-        "--max-chunks", type=int, default=None,
-        help="Limit perplexity chunks (for quick tests)",
-    )
     args = parser.parse_args()
 
     # Validate configs
@@ -330,8 +291,6 @@ def main():
 
     for bench_name in benchmarks:
         extra_args = []
-        if bench_name == "perplexity" and args.max_chunks is not None:
-            extra_args = ["--max-chunks", str(args.max_chunks)]
 
         success, elapsed = run_benchmark(
             bench_name,

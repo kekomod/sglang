@@ -6,7 +6,7 @@ and prints comparison tables with PASS/FAIL vs paper targets.
 
 Usage:
     python run_all.py
-    python run_all.py --configs bf16,turboquant_3bit --benchmarks perplexity,gsm8k
+    python run_all.py --configs bf16,turboquant_3.5bit --benchmarks needle,gsm8k
     python run_all.py --resume --output-dir results/
 """
 
@@ -28,10 +28,8 @@ from common import (
 # Benchmark runners — imported here so run_all.py is the single entry point
 from eval_gsm8k import run_gsm8k_benchmark
 from eval_needle import run_needle_benchmark
-from eval_perplexity import compute_perplexity
 
 BENCHMARK_RUNNERS = {
-    "perplexity": lambda base_url, **kw: compute_perplexity(base_url, max_chunks=kw.get("max_chunks")),
     "needle": lambda base_url, **kw: run_needle_benchmark(base_url, context_lengths=[1024, 2048, 3072, 4096]),
     "gsm8k": lambda base_url, **kw: run_gsm8k_benchmark(base_url),
 }
